@@ -48,14 +48,17 @@ export async function POST(request: NextRequest) {
 
     const formData = await request.formData();
     const file = formData.get('file') as File;
+    const projectId = formData.get('projectId') as string; // Получаем projectId
+    const autoSummary = formData.get('autoSummary') === 'true';
 
     if (!file) {
       return NextResponse.json({ error: 'Файл не предоставлен' }, { status: 400 });
     }
 
     console.log(`Файл: ${file.name}, ${file.size} bytes, тип: ${file.type}`);
+    console.log(`Проект: ${projectId}, Авто-саммари: ${autoSummary}`);
 
-    // Проверка типа файла - ПОКА ТОЛЬКО TXT И DOCX
+    // Проверка типа файла
     const allowedTypes = [
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       'text/plain'
@@ -110,18 +113,25 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Документ пустой или слишком короткий' }, { status: 400 });
     }
 
-    // Сохранение в БД
+    // Сохранение в БД с project_id
     console.log('Сохранение в БД...');
+    const docToInsert: any = {
+      user_id: user.id,
+      filename: file.name,
+      storage_path: storagePath,
+      file_type: file.type,
+      file_size: file.size,
+      content_preview: parsedText.substring(0, 500),
+    };
+
+    // Добавляем project_id только если он есть
+    if (projectId && projectId !== 'null' && projectId !== 'undefined') {
+      docToInsert.project_id = projectId;
+    }
+
     const { data: docData, error: dbError } = await supabase
         .from('documents')
-        .insert({
-          user_id: user.id,
-          filename: file.name,
-          storage_path: storagePath,
-          file_type: file.type,
-          file_size: file.size,
-          content_preview: parsedText.substring(0, 500),
-        })
+        .insert(docToInsert)
         .select()
         .single();
 
@@ -168,6 +178,7 @@ export async function POST(request: NextRequest) {
     const chunksToInsert = chunks.map((chunk, index) => ({
       document_id: docData.id,
       user_id: user.id,
+      project_id: projectId && projectId !== 'null' && projectId !== 'undefined' ? projectId : null, // Добавляем project_id
       chunk_text: chunk,
       chunk_index: index,
       embedding: embeddings[index],
@@ -191,6 +202,7 @@ export async function POST(request: NextRequest) {
       filename: file.name,
       documentId: docData.id,
       chunksCount: chunks.length,
+      projectId: projectId
     });
 
   } catch (error) {
