@@ -13,12 +13,17 @@ interface Document {
     created_at: string;
 }
 
+interface Message {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
 export default function Home() {
     const [file, setFile] = useState<File | null>(null);
     const [uploading, setUploading] = useState(false);
     const [uploadStatus, setUploadStatus] = useState<string>('');
     const [question, setQuestion] = useState('');
-    const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
+    const [messages, setMessages] = useState<Message[]>([]);
     const [asking, setAsking] = useState(false);
     const [user, setUser] = useState<any>(null);
     const [loading, setLoading] = useState(true);
@@ -38,6 +43,7 @@ export default function Home() {
                 router.push('/login');
             } else {
                 loadDocuments();
+                loadChatHistory();
             }
         });
 
@@ -54,6 +60,27 @@ export default function Home() {
 
         return () => subscription.unsubscribe();
     }, [router]);
+
+    const loadChatHistory = async () => {
+        try {
+            const { data, error } = await supabase
+                .from('messages')
+                .select('role, content, created_at')
+                .order('created_at', { ascending: true })
+                .limit(50);
+
+            if (error) {
+                console.error('Error loading chat history:', error);
+            } else if (data && data.length > 0) {
+                setMessages(data.map(msg => ({
+                    role: msg.role as 'user' | 'assistant',
+                    content: msg.content,
+                })));
+            }
+        } catch (error) {
+            console.error('Error loading chat history:', error);
+        }
+    };
 
     const loadDocuments = async () => {
         setLoadingDocs(true);
@@ -100,7 +127,7 @@ export default function Home() {
         }
 
         setUploading(true);
-        setUploadStatus('Загрузка...');
+        setUploadStatus('Загрузка и обработка документа...');
 
         try {
             const formData = new FormData();
@@ -117,25 +144,24 @@ export default function Home() {
             const data = await response.json();
 
             if (response.ok) {
-                setUploadStatus(`Успешно загружено: ${data.filename}`);
+                setUploadStatus(`✅ Успешно загружено: ${data.filename} (${data.chunksCount} фрагментов)`);
                 setFile(null);
                 const fileInput = document.getElementById('fileInput') as HTMLInputElement;
                 if (fileInput) fileInput.value = '';
 
-                // Перезагрузить список документов
                 await loadDocuments();
             } else {
-                setUploadStatus(`Ошибка: ${data.error}`);
+                setUploadStatus(`❌ Ошибка: ${data.error}`);
             }
         } catch (error) {
-            setUploadStatus(`Ошибка загрузки: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
+            setUploadStatus(`❌ Ошибка загрузки: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
         } finally {
             setUploading(false);
         }
     };
 
     const handleDeleteDocument = async (docId: string) => {
-        if (!confirm('Удалить этот документ?')) return;
+        if (!confirm('Удалить этот документ? Это также удалит все связанные с ним фрагменты.')) return;
 
         try {
             const { error } = await supabase
@@ -176,15 +202,26 @@ export default function Home() {
             if (response.ok) {
                 setMessages(prev => [...prev, { role: 'assistant', content: data.answer }]);
             } else {
-                setMessages(prev => [...prev, { role: 'assistant', content: `Ошибка: ${data.error}` }]);
+                setMessages(prev => [...prev, { role: 'assistant', content: `❌ Ошибка: ${data.error}` }]);
             }
         } catch (error) {
             setMessages(prev => [...prev, {
                 role: 'assistant',
-                content: `Ошибка: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
+                content: `❌ Ошибка: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
             }]);
         } finally {
             setAsking(false);
+        }
+    };
+
+    const clearChat = async () => {
+        if (!confirm('Очистить историю чата?')) return;
+
+        try {
+            await supabase.from('messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+            setMessages([]);
+        } catch (error) {
+            alert('Ошибка очистки чата');
         }
     };
 
@@ -220,7 +257,7 @@ export default function Home() {
     return (
         <main className="min-h-screen p-8 max-w-6xl mx-auto">
             <div className="flex justify-between items-center mb-8">
-                <h1 className="text-3xl font-bold">Личный RAG Агент</h1>
+                <h1 className="text-3xl font-bold">🧠 Личный RAG Агент</h1>
                 <div className="flex items-center gap-4">
                     <span className="text-sm text-gray-600 dark:text-gray-400">{user.email}</span>
                     <button
@@ -237,18 +274,18 @@ export default function Home() {
                 <div className="space-y-6">
                     {/* Document Upload Section */}
                     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
-                        <h2 className="text-xl font-semibold mb-4">Загрузка документов</h2>
+                        <h2 className="text-xl font-semibold mb-4">📄 Загрузка документов</h2>
                         <div className="space-y-4">
                             <div>
                                 <input
                                     id="fileInput"
                                     type="file"
-                                    accept=".pdf,.docx,.txt"
+                                    accept=".docx,.txt"
                                     onChange={handleFileChange}
                                     className="block w-full text-sm text-gray-900 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer bg-gray-50 dark:bg-gray-700 focus:outline-none p-2"
                                 />
                                 <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                                    Поддерживаются: PDF, DOCX, TXT
+                                    Поддерживаются: DOCX, TXT (PDF скоро) (макс. 10 MB)
                                 </p>
                             </div>
 
@@ -257,11 +294,15 @@ export default function Home() {
                                 disabled={!file || uploading}
                                 className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg transition duration-200"
                             >
-                                {uploading ? 'Загрузка...' : 'Загрузить'}
+                                {uploading ? '⏳ Обработка...' : '📤 Загрузить'}
                             </button>
 
                             {uploadStatus && (
-                                <div className={`p-3 rounded-lg ${uploadStatus.includes('Ошибка') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+                                <div className={`p-3 rounded-lg text-sm ${
+                                    uploadStatus.includes('❌')
+                                        ? 'bg-red-100 text-red-700 dark:bg-red-900/20 dark:text-red-400'
+                                        : 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                                }`}>
                                     {uploadStatus}
                                 </div>
                             )}
@@ -271,13 +312,13 @@ export default function Home() {
                     {/* Documents List */}
                     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
                         <div className="flex justify-between items-center mb-4">
-                            <h2 className="text-xl font-semibold">Мои документы</h2>
+                            <h2 className="text-xl font-semibold">📚 Мои документы ({documents.length})</h2>
                             <button
                                 onClick={loadDocuments}
                                 disabled={loadingDocs}
                                 className="text-sm text-blue-600 hover:text-blue-700 disabled:text-gray-400"
                             >
-                                {loadingDocs ? 'Загрузка...' : 'Обновить'}
+                                {loadingDocs ? '⏳' : '🔄'} Обновить
                             </button>
                         </div>
 
@@ -286,7 +327,7 @@ export default function Home() {
                                 Документы еще не загружены
                             </p>
                         ) : (
-                            <div className="space-y-2">
+                            <div className="space-y-2 max-h-96 overflow-y-auto">
                                 {documents.map((doc) => (
                                     <div
                                         key={doc.id}
@@ -294,7 +335,7 @@ export default function Home() {
                                     >
                                         <div className="flex-1 min-w-0">
                                             <p className="text-sm font-medium truncate">
-                                                {doc.filename}
+                                                📄 {doc.filename}
                                             </p>
                                             <p className="text-xs text-gray-500 dark:text-gray-400">
                                                 {formatFileSize(doc.file_size)} • {formatDate(doc.created_at)}
@@ -304,7 +345,7 @@ export default function Home() {
                                             onClick={() => handleDeleteDocument(doc.id)}
                                             className="ml-2 text-red-600 hover:text-red-700 text-sm"
                                         >
-                                            Удалить
+                                            🗑️
                                         </button>
                                     </div>
                                 ))}
@@ -315,7 +356,16 @@ export default function Home() {
 
                 {/* Right Column - Chat */}
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
-                    <h2 className="text-xl font-semibold mb-4">Чат с документами</h2>
+                    <div className="flex justify-between items-center mb-4">
+                        <h2 className="text-xl font-semibold">💬 Чат с документами</h2>
+                        <button
+                            onClick={clearChat}
+                            className="text-sm text-gray-600 hover:text-gray-700"
+                            title="Очистить историю"
+                        >
+                            🗑️ Очистить
+                        </button>
+                    </div>
 
                     {/* Messages */}
                     <div className="space-y-4 mb-4 h-96 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -323,10 +373,10 @@ export default function Home() {
                             <div className="text-center py-12">
                                 <p className="text-gray-500 mb-4">Загрузите документы и начните задавать вопросы</p>
                                 <div className="text-sm text-gray-400 space-y-2">
-                                    <p>📄 У вас загружено документов: <strong>{documents.length}</strong></p>
+                                    <p>📄 Документов: <strong>{documents.length}</strong></p>
                                     {documents.length > 0 && (
-                                        <p className="text-yellow-600">
-                                            ⚠️ Функция RAG (поиск по документам) будет реализована на следующем этапе
+                                        <p className="text-green-600 dark:text-green-400">
+                                            ✅ RAG активирован! Задавайте вопросы по документам
                                         </p>
                                     )}
                                 </div>
@@ -342,7 +392,7 @@ export default function Home() {
                                     }`}
                                 >
                                     <p className="text-sm font-semibold mb-1">
-                                        {msg.role === 'user' ? 'Вы' : 'Ассистент'}
+                                        {msg.role === 'user' ? '👤 Вы' : '🤖 Ассистент'}
                                     </p>
                                     <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
                                 </div>
@@ -366,17 +416,18 @@ export default function Home() {
                             disabled={!question.trim() || asking}
                             className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-2 px-6 rounded-lg transition duration-200"
                         >
-                            {asking ? 'Думаю...' : 'Отправить'}
+                            {asking ? '⏳' : '📤'}
                         </button>
                     </div>
 
-                    <div className="mt-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg">
-                        <p className="text-sm text-yellow-800 dark:text-yellow-200">
-                            <strong>Статус:</strong> Базовая версия работает! ✅
+                    <div className="mt-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                        <p className="text-sm text-green-800 dark:text-green-200">
+                            <strong>✅ RAG активирован!</strong>
                         </p>
-                        <p className="text-xs text-yellow-700 dark:text-yellow-300 mt-1">
-                            • Загрузка документов работает<br/>
-                            • Следующий этап (Prompt B): RAG поиск и ответы по документам
+                        <p className="text-xs text-green-700 dark:text-green-300 mt-1">
+                            • Векторный поиск по документам<br/>
+                            • Ответы от Claude на основе ваших данных<br/>
+                            • История чата сохраняется
                         </p>
                     </div>
                 </div>
