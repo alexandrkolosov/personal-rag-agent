@@ -151,6 +151,120 @@ OUTPUT STYLE: Match the requirements of the request
 `
 };
 
+// lib/prompt.ts - добавить новые типы и функции
+
+export interface ClarificationQuestion {
+    id: string;
+    question: string;
+    type: 'select' | 'multiselect' | 'text' | 'boolean' | 'date_range';
+    options?: string[];
+    required: boolean;
+    context?: string; // Почему спрашиваем
+}
+
+export interface ClarificationResponse {
+    mode: 'needs_clarification';
+    clarifications: ClarificationQuestion[];
+    partialInsight?: string; // Что уже можем сказать
+    confidence: number;
+    originalQuestion: string;
+}
+
+// Функция анализа необходимости уточнений
+export function analyzeClarificationNeed(
+    question: string,
+    documentContext: any[],
+    projectRole?: string
+): { needed: boolean; questions?: ClarificationQuestion[]; preliminaryInsight?: string } {
+
+    const lowerQ = question.toLowerCase();
+    const clarifications: ClarificationQuestion[] = [];
+
+    // Проверяем неопределенности
+    if (lowerQ.includes('анализ') || lowerQ.includes('analyze')) {
+        if (!lowerQ.match(/за (.*) период|с (\d{4})|последн/)) {
+            clarifications.push({
+                id: 'time_period',
+                question: 'За какой период провести анализ?',
+                type: 'select',
+                options: ['Последний месяц', 'Последний квартал', 'Последний год', 'Все время', 'Другой период'],
+                required: true,
+                context: 'Для точного анализа нужно определить временные рамки'
+            });
+        }
+    }
+
+    if (lowerQ.includes('сравн') || lowerQ.includes('compar')) {
+        if (!lowerQ.includes('с ')) {
+            clarifications.push({
+                id: 'comparison_target',
+                question: 'С чем сравнить?',
+                type: 'multiselect',
+                options: ['Конкуренты', 'Прошлый период', 'Рыночные стандарты', 'План/бюджет'],
+                required: true,
+                context: 'Уточните базу для сравнения'
+            });
+        }
+    }
+
+    if (lowerQ.includes('отчет') || lowerQ.includes('report')) {
+        clarifications.push({
+            id: 'report_format',
+            question: 'В каком формате подготовить отчет?',
+            type: 'select',
+            options: ['Executive Summary', 'Детальный анализ', 'Презентация', 'Таблица метрик'],
+            required: false,
+            context: 'Выберите уровень детализации'
+        });
+    }
+
+    // Проверяем достаточность контекста
+    const hasRelevantDocs = documentContext.some(d => d.similarity > 0.7);
+    if (!hasRelevantDocs && documentContext.length > 0) {
+        clarifications.push({
+            id: 'search_web',
+            question: 'Документы содержат мало релевантной информации. Искать дополнительные данные в интернете?',
+            type: 'boolean',
+            required: false,
+            context: 'Это поможет дополнить анализ актуальными данными'
+        });
+    }
+
+    const preliminaryInsight = hasRelevantDocs
+        ? `Найдено ${documentContext.filter(d => d.similarity > 0.7).length} релевантных документов. После уточнений смогу провести детальный анализ.`
+        : `По вашему вопросу есть ограниченная информация в документах. Уточнения помогут сформировать точный ответ.`;
+
+    return {
+        needed: clarifications.length > 0,
+        questions: clarifications,
+        preliminaryInsight
+    };
+}
+
+// Функция объединения вопроса с уточнениями
+export function mergeQuestionWithClarifications(
+    originalQuestion: string,
+    clarifications: Record<string, any>
+): string {
+    let enrichedQuestion = originalQuestion;
+
+    if (clarifications.time_period) {
+        enrichedQuestion += ` [Период: ${clarifications.time_period}]`;
+    }
+
+    if (clarifications.comparison_target) {
+        const targets = Array.isArray(clarifications.comparison_target)
+            ? clarifications.comparison_target.join(', ')
+            : clarifications.comparison_target;
+        enrichedQuestion += ` [Сравнить с: ${targets}]`;
+    }
+
+    if (clarifications.report_format) {
+        enrichedQuestion += ` [Формат: ${clarifications.report_format}]`;
+    }
+
+    return enrichedQuestion;
+}
 // Типы задач для разных подходов
 export const TASK_TYPES = {
     ANALYSIS: 'analysis',

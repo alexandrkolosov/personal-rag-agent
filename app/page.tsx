@@ -42,6 +42,11 @@ export default function Home() {
     const [autoSummary, setAutoSummary] = useState(true);
     const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([]);
 
+    // НОВОЕ: стейты для web search и уточнений
+    const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+    const [forceWebSearch, setForceWebSearch] = useState(false);
+    const [clarificationMode, setClarificationMode] = useState<any>(null);
+
     // Получение пользователя и сессии
     useEffect(() => {
         supabase.auth.getSession().then(({ data: { session } }) => {
@@ -219,7 +224,6 @@ export default function Home() {
     };
 
     // Загрузка файла
-    // Загрузка файла
     const handleUpload = async () => {
         if (!file || !session) {
             setUploadStatus('Ошибка: нет файла или сессии');
@@ -231,9 +235,11 @@ export default function Home() {
             return;
         }
 
-        const allowedTypes = ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'];
-        if (!allowedTypes.includes(file.type)) {
-            setUploadStatus('Поддерживаются только DOCX и TXT файлы');
+        const allowedExtensions = ['.docx', '.txt', '.xlsx', '.xls', '.csv'];
+        const fileExtension = '.' + file.name.split('.').pop()?.toLowerCase();
+
+        if (!allowedExtensions.includes(fileExtension)) {
+            setUploadStatus('Поддерживаются только DOCX, TXT, XLSX, XLS и CSV файлы');
             return;
         }
 
@@ -243,7 +249,7 @@ export default function Home() {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            formData.append('projectId', activeProject.id); // Передаем ID проекта
+            formData.append('projectId', activeProject.id);
             formData.append('autoSummary', autoSummary.toString());
 
             const response = await fetch('/api/ingest', {
@@ -257,11 +263,12 @@ export default function Home() {
             const data = await response.json();
 
             if (response.ok) {
-                setUploadStatus(`✅ Успешно: ${data.filename} (${data.chunksCount} фрагментов)`);
+                const fileType = data.fileType === 'Excel' ? '📊 Excel' : '📄';
+                setUploadStatus(`✅ Успешно: ${fileType} ${data.filename} (${data.chunksCount} фрагментов)`);
                 setFile(null);
                 const fileInput = document.getElementById('fileInput') as HTMLInputElement;
                 if (fileInput) fileInput.value = '';
-                await loadDocuments(); // Перезагружаем список документов
+                await loadDocuments();
             } else {
                 setUploadStatus(`❌ Ошибка: ${data.error}`);
             }
@@ -292,7 +299,72 @@ export default function Home() {
         }
     };
 
-    // Отправка вопроса
+    // НОВОЕ: обработка уточнений
+    const handleClarificationResponse = async (answers: Record<string, any>) => {
+        setClarificationMode(null);
+        setAsking(true);
+
+        try {
+            const response = await fetch('/api/ask', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${session.access_token}`,
+                },
+                body: JSON.stringify({
+                    question: clarificationMode.originalQuestion,
+                    clarificationAnswers: answers,
+                    projectId: activeProject?.id,
+                    role: activeProject?.role,
+                    webSearchEnabled,
+                    forceWebSearch
+                }),
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                let finalAnswer = data.answer;
+
+                if (typeof finalAnswer === 'string' &&
+                    (finalAnswer.includes('"answer"') || finalAnswer.startsWith('{'))) {
+                    try {
+                        const parsed = JSON.parse(finalAnswer);
+                        finalAnswer = parsed.answer || finalAnswer;
+                    } catch (e) {
+                        console.log('Answer is plain text, using as is');
+                    }
+                }
+
+                setMessages(prev => [...prev, {
+                    role: 'assistant',
+                    content: finalAnswer,
+                    sources: data.sources || [],
+                    insights: data.insights || [],
+                    follow_up_questions: data.follow_up_questions || []
+                }]);
+
+                if (data.follow_up_questions && data.follow_up_questions.length > 0) {
+                    setSuggestedQuestions(data.follow_up_questions);
+                }
+            } else {
+                const errorMessage = data.answer || data.error || 'Произошла ошибка';
+                setMessages(prev => [...prev, {
+                    role: 'assistant',
+                    content: `❌ ${errorMessage}`
+                }]);
+            }
+        } catch (error) {
+            setMessages(prev => [...prev, {
+                role: 'assistant',
+                content: `❌ Ошибка соединения: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
+            }]);
+        } finally {
+            setAsking(false);
+        }
+    };
+
+    // Модифицированная отправка вопроса
     const handleAsk = async () => {
         if (!question.trim() || !session) return;
 
@@ -311,30 +383,59 @@ export default function Home() {
                 body: JSON.stringify({
                     question: userMessage,
                     projectId: activeProject?.id,
-                    role: activeProject?.role
+                    role: activeProject?.role,
+                    webSearchEnabled,     // НОВОЕ
+                    forceWebSearch        // НОВОЕ
                 }),
             });
 
             const data = await response.json();
 
+            // НОВОЕ: обработка режима уточнений
+            if (data.mode === 'needs_clarification') {
+                setClarificationMode({
+                    ...data,
+                    originalQuestion: userMessage
+                });
+                setAsking(false);
+                return;
+            }
+
             if (response.ok) {
+                let finalAnswer = data.answer;
+
+                if (typeof finalAnswer === 'string' &&
+                    (finalAnswer.includes('"answer"') || finalAnswer.startsWith('{'))) {
+                    try {
+                        const parsed = JSON.parse(finalAnswer);
+                        finalAnswer = parsed.answer || finalAnswer;
+                    } catch (e) {
+                        console.log('Answer is plain text, using as is');
+                    }
+                }
+
                 setMessages(prev => [...prev, {
                     role: 'assistant',
-                    content: data.answer,
-                    sources: data.sources,
-                    follow_up_questions: data.follow_up_questions
+                    content: finalAnswer,
+                    sources: data.sources || [],
+                    insights: data.insights || [],
+                    follow_up_questions: data.follow_up_questions || []
                 }]);
 
-                if (data.follow_up_questions) {
+                if (data.follow_up_questions && data.follow_up_questions.length > 0) {
                     setSuggestedQuestions(data.follow_up_questions);
                 }
             } else {
-                setMessages(prev => [...prev, { role: 'assistant', content: `❌ Ошибка: ${data.error}` }]);
+                const errorMessage = data.answer || data.error || 'Произошла ошибка';
+                setMessages(prev => [...prev, {
+                    role: 'assistant',
+                    content: `❌ ${errorMessage}`
+                }]);
             }
         } catch (error) {
             setMessages(prev => [...prev, {
                 role: 'assistant',
-                content: `❌ Ошибка: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
+                content: `❌ Ошибка соединения: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`
             }]);
         } finally {
             setAsking(false);
@@ -479,6 +580,35 @@ export default function Home() {
                 </div>
             </div>
 
+            {/* НОВОЕ: Панель настроек поиска */}
+            <div className="bg-gray-800 border-b border-gray-700 px-4 py-2">
+                <div className="max-w-7xl mx-auto flex items-center justify-between">
+                    <div className="flex items-center gap-4">
+                        <label className="flex items-center gap-2 text-sm">
+                            <input
+                                type="checkbox"
+                                checked={webSearchEnabled}
+                                onChange={(e) => setWebSearchEnabled(e.target.checked)}
+                                className="rounded"
+                            />
+                            <span>🌐 Web Search</span>
+                        </label>
+
+                        {webSearchEnabled && (
+                            <label className="flex items-center gap-2 text-sm">
+                                <input
+                                    type="checkbox"
+                                    checked={forceWebSearch}
+                                    onChange={(e) => setForceWebSearch(e.target.checked)}
+                                    className="rounded"
+                                />
+                                <span>Всегда искать в web</span>
+                            </label>
+                        )}
+                    </div>
+                </div>
+            </div>
+
             {/* Основной контент */}
             {activeProject ? (
                 <div className="max-w-7xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -492,8 +622,11 @@ export default function Home() {
                                 type="file"
                                 onChange={handleFileChange}
                                 className="block w-full mb-2 text-sm text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:bg-gray-700 file:text-white hover:file:bg-gray-600"
-                                accept=".txt,.docx"
+                                accept=".txt,.docx,.xlsx,.xls,.csv"
                             />
+                            <div className="text-xs text-gray-400 mb-2">
+                                Поддерживаются: DOCX, TXT, XLSX, XLS, CSV
+                            </div>
                             <button
                                 onClick={handleUpload}
                                 disabled={!file || uploading}
@@ -571,13 +704,14 @@ export default function Home() {
                     </div>
 
                     {/* Центр - чат */}
-                    <div className="lg:col-span-2 bg-gray-800 rounded-lg p-4 flex flex-col h-[calc(100vh-140px)]">
+                    <div className="lg:col-span-2 bg-gray-800 rounded-lg p-4 flex flex-col h-[calc(100vh-180px)]">
                         {/* Контекстная строка */}
                         <div className="bg-gray-700 rounded p-2 mb-3 text-sm flex justify-between items-center">
                             <div>
                                 📁 Проект: <strong>{activeProject.name}</strong> |
                                 🤖 Роль: <strong>{AI_ROLES[activeProject.role]?.split(' - ')[0] || activeProject.role}</strong> |
                                 📄 Документов: <strong>{projectDocuments.length}</strong>
+                                {webSearchEnabled && ' | 🌐 Web: ON'}
                             </div>
                             <button
                                 onClick={clearChat}
@@ -666,7 +800,7 @@ export default function Home() {
                     </div>
                 </div>
             ) : (
-                <div className="flex items-center justify-center h-[calc(100vh-80px)]">
+                <div className="flex items-center justify-center h-[calc(100vh-120px)]">
                     <div className="text-center">
                         <h2 className="text-2xl mb-4">👋 Добро пожаловать!</h2>
                         <p className="text-gray-400 mb-6">Создайте первый проект для работы с документами</p>
@@ -734,6 +868,126 @@ export default function Home() {
                                 className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2 rounded transition"
                             >
                                 Отмена
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* НОВОЕ: Модалка уточнений */}
+            {clarificationMode && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                    <div className="bg-gray-800 p-6 rounded-lg max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+                        <h2 className="text-xl mb-4">Уточняющие вопросы</h2>
+
+                        {clarificationMode.partialInsight && (
+                            <div className="bg-gray-700 p-3 rounded mb-4 text-sm">
+                                💡 {clarificationMode.partialInsight}
+                            </div>
+                        )}
+
+                        <div className="space-y-4">
+                            {clarificationMode.clarifications?.map((q: any) => (
+                                <div key={q.id} className="space-y-2">
+                                    <label className="block text-sm font-medium">
+                                        {q.question}
+                                        {q.required && <span className="text-red-400">*</span>}
+                                    </label>
+
+                                    {q.context && (
+                                        <p className="text-xs text-gray-400">{q.context}</p>
+                                    )}
+
+                                    {q.type === 'select' && (
+                                        <select
+                                            id={q.id}
+                                            className="w-full bg-gray-700 px-3 py-2 rounded"
+                                        >
+                                            <option value="">Выберите...</option>
+                                            {q.options?.map((opt: string) => (
+                                                <option key={opt} value={opt}>{opt}</option>
+                                            ))}
+                                        </select>
+                                    )}
+
+                                    {q.type === 'multiselect' && (
+                                        <div className="space-y-1">
+                                            {q.options?.map((opt: string) => (
+                                                <label key={opt} className="flex items-center gap-2">
+                                                    <input type="checkbox" value={opt} id={`${q.id}_${opt}`} />
+                                                    <span className="text-sm">{opt}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    )}
+
+                                    {q.type === 'text' && (
+                                        <input
+                                            type="text"
+                                            id={q.id}
+                                            className="w-full bg-gray-700 px-3 py-2 rounded"
+                                        />
+                                    )}
+
+                                    {q.type === 'boolean' && (
+                                        <div className="flex gap-4">
+                                            <label className="flex items-center gap-2">
+                                                <input type="radio" name={q.id} value="true" />
+                                                <span>Да</span>
+                                            </label>
+                                            <label className="flex items-center gap-2">
+                                                <input type="radio" name={q.id} value="false" />
+                                                <span>Нет</span>
+                                            </label>
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="flex gap-2 mt-6">
+                            <button
+                                onClick={() => {
+                                    // Собираем ответы
+                                    const answers: any = {};
+                                    clarificationMode.clarifications?.forEach((q: any) => {
+                                        if (q.type === 'multiselect') {
+                                            const selected: string[] = [];
+                                            q.options?.forEach((opt: string) => {
+                                                const element = document.getElementById(`${q.id}_${opt}`) as HTMLInputElement;
+                                                if (element?.checked) {
+                                                    selected.push(opt);
+                                                }
+                                            });
+                                            answers[q.id] = selected;
+                                        } else if (q.type === 'boolean') {
+                                            const radios = document.getElementsByName(q.id) as NodeListOf<HTMLInputElement>;
+                                            radios.forEach((radio) => {
+                                                if (radio.checked) {
+                                                    answers[q.id] = radio.value === 'true';
+                                                }
+                                            });
+                                        } else {
+                                            const element = document.getElementById(q.id) as HTMLInputElement;
+                                            if (element) {
+                                                answers[q.id] = element.value;
+                                            }
+                                        }
+                                    });
+                                    handleClarificationResponse(answers);
+                                }}
+                                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded"
+                            >
+                                Отправить
+                            </button>
+                            <button
+                                onClick={() => {
+                                    setClarificationMode(null);
+                                    // Можно отправить вопрос без уточнений если это допустимо
+                                }}
+                                className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2 rounded"
+                            >
+                                Пропустить
                             </button>
                         </div>
                     </div>

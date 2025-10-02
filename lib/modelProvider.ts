@@ -34,7 +34,7 @@ const anthropic = new Anthropic({
 
 export async function chatWithAI(args: ChatArgs): Promise<string> {
 
-  const maxTokens = args.maxTokens ?? 8000;
+  const maxTokens = args.maxTokens ?? 4000;
 
 
 
@@ -130,7 +130,7 @@ async function callAnthropic(system: string, user: string, maxTokens: number): P
 
     max_tokens: Math.min(maxTokens, 8192),
 
-    temperature: 0.7,
+    temperature: 0.1,
 
     system: system,
 
@@ -174,7 +174,7 @@ async function callOpenAI(system: string, user: string, maxTokens: number): Prom
 
     max_tokens: Math.min(maxTokens, 8000),
 
-    temperature: 0.7,
+    temperature: 0.1,
 
   });
 
