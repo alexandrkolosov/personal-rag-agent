@@ -1,8 +1,12 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '../lib/supabase-browser';
 import { useRouter } from 'next/navigation';
+import { useDebounce } from '../hooks/useDebounce';
+import MessageItem from './components/MessageItem';
 
 const supabase = createClient();
 
@@ -46,6 +50,9 @@ export default function Home() {
     const [webSearchEnabled, setWebSearchEnabled] = useState(false);
     const [forceWebSearch, setForceWebSearch] = useState(false);
     const [clarificationMode, setClarificationMode] = useState<any>(null);
+    const [searchMode, setSearchMode] = useState<'web' | 'academic' | 'sec'>('web');
+    const [domainFilter, setDomainFilter] = useState<string>('');
+    const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
 
     // Получение пользователя и сессии
     useEffect(() => {
@@ -82,7 +89,7 @@ export default function Home() {
     }, [router]);
 
     // Загрузка проектов (создаем таблицу projects если её нет)
-    const loadProjects = async (currentUser: any) => {
+    const loadProjects = useCallback(async (currentUser: any) => {
         if (!currentUser) return;
 
         try {
@@ -101,10 +108,10 @@ export default function Home() {
         } catch (error) {
             console.error('Error loading projects:', error);
         }
-    };
+    }, [activeProject]);
 
     // Загрузка документов
-    const loadDocuments = async (currentUser?: any) => {
+    const loadDocuments = useCallback(async (currentUser?: any) => {
         const userId = currentUser?.id || user?.id;
         if (!userId) return;
 
@@ -133,10 +140,10 @@ export default function Home() {
         } finally {
             setLoadingDocs(false);
         }
-    };
+    }, [user?.id, activeProject]);
 
     // Загрузка истории чата
-    const loadChatHistory = async (currentUser?: any) => {
+    const loadChatHistory = useCallback(async (currentUser?: any) => {
         const userId = currentUser?.id || user?.id;
         if (!userId) return;
 
@@ -158,12 +165,17 @@ export default function Home() {
             if (error) {
                 console.error('Error loading chat history:', error);
             } else if (data && data.length > 0) {
+                // Восстанавливаем сообщения с полными метаданными
                 setMessages(data.map(msg => ({
                     role: msg.role as 'user' | 'assistant',
                     content: msg.content,
                     sources: msg.metadata?.sources,
+                    webSources: msg.metadata?.webSources || [],
+                    webImages: msg.metadata?.webImages || [],
                     insights: msg.metadata?.insights,
-                    follow_up_questions: msg.metadata?.follow_up_questions
+                    follow_up_questions: msg.metadata?.follow_up_questions,
+                    perplexityModel: msg.metadata?.perplexityModel,
+                    usedWebSearch: msg.metadata?.usedWebSearch
                 })));
 
                 // Устанавливаем предложенные вопросы из последнего ответа
@@ -175,15 +187,26 @@ export default function Home() {
         } catch (error) {
             console.error('Error loading chat history:', error);
         }
-    };
+    }, [user?.id, activeProject]);
 
-    // Перезагрузка данных при смене проекта
+    // Перезагрузка данных при смене проекта (параллельно)
     useEffect(() => {
         if (activeProject && user) {
-            loadDocuments();
-            loadChatHistory();
+            // Очищаем сообщения при переключении проекта для мгновенного отклика
+            setMessages([]);
+            setSuggestedQuestions([]);
+
+            // Параллельная загрузка для лучшей производительности
+            Promise.all([
+                loadDocuments(),
+                loadChatHistory()
+            ]);
+        } else if (!activeProject) {
+            // Если нет активного проекта, очищаем чат
+            setMessages([]);
+            setSuggestedQuestions([]);
         }
-    }, [activeProject]);
+    }, [activeProject, user, loadDocuments, loadChatHistory]);
 
     // Создание проекта
     const createProject = async () => {
@@ -340,8 +363,12 @@ export default function Home() {
                     role: 'assistant',
                     content: finalAnswer,
                     sources: data.sources || [],
+                    webSources: data.webSources || [],
+                    webImages: data.webImages || [],
                     insights: data.insights || [],
-                    follow_up_questions: data.follow_up_questions || []
+                    follow_up_questions: data.follow_up_questions || [],
+                    perplexityModel: data.perplexityModel,
+                    usedWebSearch: data.usedWebSearch
                 }]);
 
                 if (data.follow_up_questions && data.follow_up_questions.length > 0) {
@@ -384,8 +411,10 @@ export default function Home() {
                     question: userMessage,
                     projectId: activeProject?.id,
                     role: activeProject?.role,
-                    webSearchEnabled,     // НОВОЕ
-                    forceWebSearch        // НОВОЕ
+                    webSearchEnabled,
+                    forceWebSearch,
+                    searchMode,           // НОВОЕ
+                    domainFilter          // НОВОЕ
                 }),
             });
 
@@ -418,8 +447,12 @@ export default function Home() {
                     role: 'assistant',
                     content: finalAnswer,
                     sources: data.sources || [],
+                    webSources: data.webSources || [],
+                    webImages: data.webImages || [],
                     insights: data.insights || [],
-                    follow_up_questions: data.follow_up_questions || []
+                    follow_up_questions: data.follow_up_questions || [],
+                    perplexityModel: data.perplexityModel,
+                    usedWebSearch: data.usedWebSearch
                 }]);
 
                 if (data.follow_up_questions && data.follow_up_questions.length > 0) {
@@ -449,15 +482,26 @@ export default function Home() {
         alert(`Экспорт в ${format} будет добавлен в следующей версии`);
     };
 
-    // Очистка чата
+    // Очистка чата текущего проекта
     const clearChat = async () => {
-        if (!confirm('Очистить историю чата?')) return;
+        if (!confirm('Очистить историю чата этого проекта?')) return;
 
         try {
-            await supabase
-                .from('messages')
-                .delete()
-                .neq('id', '00000000-0000-0000-0000-000000000000');
+            if (activeProject) {
+                // Удаляем только сообщения текущего проекта
+                await supabase
+                    .from('messages')
+                    .delete()
+                    .eq('project_id', activeProject.id)
+                    .eq('user_id', user.id);
+            } else {
+                // Если нет активного проекта, удаляем все сообщения без project_id
+                await supabase
+                    .from('messages')
+                    .delete()
+                    .is('project_id', null)
+                    .eq('user_id', user.id);
+            }
             setMessages([]);
             setSuggestedQuestions([]);
         } catch (error) {
@@ -484,10 +528,12 @@ export default function Home() {
         });
     };
 
-    // Документы текущего проекта
-    const projectDocuments = activeProject
-        ? documents.filter(d => d.project_id === activeProject.id)
-        : [];
+    // Документы текущего проекта (мemoized)
+    const projectDocuments = useMemo(() =>
+        activeProject
+            ? documents.filter(d => d.project_id === activeProject.id)
+            : []
+    , [activeProject, documents]);
 
     if (loading) {
         return (
@@ -582,30 +628,104 @@ export default function Home() {
 
             {/* НОВОЕ: Панель настроек поиска */}
             <div className="bg-gray-800 border-b border-gray-700 px-4 py-2">
-                <div className="max-w-7xl mx-auto flex items-center justify-between">
-                    <div className="flex items-center gap-4">
-                        <label className="flex items-center gap-2 text-sm">
-                            <input
-                                type="checkbox"
-                                checked={webSearchEnabled}
-                                onChange={(e) => setWebSearchEnabled(e.target.checked)}
-                                className="rounded"
-                            />
-                            <span>🌐 Web Search</span>
-                        </label>
-
-                        {webSearchEnabled && (
+                <div className="max-w-7xl mx-auto">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-4 flex-wrap">
                             <label className="flex items-center gap-2 text-sm">
                                 <input
                                     type="checkbox"
-                                    checked={forceWebSearch}
-                                    onChange={(e) => setForceWebSearch(e.target.checked)}
+                                    checked={webSearchEnabled}
+                                    onChange={(e) => setWebSearchEnabled(e.target.checked)}
                                     className="rounded"
                                 />
-                                <span>Всегда искать в web</span>
+                                <span>🌐 Web Search</span>
                             </label>
-                        )}
+
+                            {webSearchEnabled && (
+                                <>
+                                    <label className="flex items-center gap-2 text-sm">
+                                        <input
+                                            type="checkbox"
+                                            checked={forceWebSearch}
+                                            onChange={(e) => setForceWebSearch(e.target.checked)}
+                                            className="rounded"
+                                        />
+                                        <span>Всегда искать</span>
+                                    </label>
+
+                                    <button
+                                        onClick={() => setShowAdvancedSearch(!showAdvancedSearch)}
+                                        className="text-sm text-blue-400 hover:text-blue-300 transition"
+                                    >
+                                        ⚙️ {showAdvancedSearch ? 'Скрыть' : 'Расширенные'}
+                                    </button>
+                                </>
+                            )}
+                        </div>
                     </div>
+
+                    {/* Расширенные настройки */}
+                    {webSearchEnabled && showAdvancedSearch && (
+                        <div className="mt-3 pt-3 border-t border-gray-700 flex gap-4 flex-wrap items-center">
+                            {/* Режим поиска */}
+                            <div className="flex items-center gap-2 text-sm">
+                                <label className="text-gray-400">Режим:</label>
+                                <select
+                                    value={searchMode}
+                                    onChange={(e) => setSearchMode(e.target.value as 'web' | 'academic' | 'sec')}
+                                    className="bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 text-sm"
+                                >
+                                    <option value="web">🌐 Web (Общий)</option>
+                                    <option value="academic">🎓 Academic (Научный)</option>
+                                    <option value="sec">📊 SEC (Финансовые отчеты)</option>
+                                </select>
+                            </div>
+
+                            {/* Фильтр доменов */}
+                            <div className="flex items-center gap-2 text-sm flex-1 min-w-[300px]">
+                                <label className="text-gray-400">Домены:</label>
+                                <input
+                                    type="text"
+                                    placeholder="example.com, scholar.google.com"
+                                    value={domainFilter}
+                                    onChange={(e) => setDomainFilter(e.target.value)}
+                                    className="flex-1 bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 text-sm placeholder-gray-500"
+                                />
+                            </div>
+
+                            {/* Предустановки */}
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => setDomainFilter('scholar.google.com, arxiv.org, nature.com, science.org')}
+                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    title="Научные источники"
+                                >
+                                    🎓 Наука
+                                </button>
+                                <button
+                                    onClick={() => setDomainFilter('sec.gov, edgar.gov')}
+                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    title="SEC финансовые отчеты"
+                                >
+                                    📊 SEC
+                                </button>
+                                <button
+                                    onClick={() => setDomainFilter('reuters.com, bloomberg.com, ft.com')}
+                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    title="Новостные источники"
+                                >
+                                    📰 Новости
+                                </button>
+                                <button
+                                    onClick={() => setDomainFilter('')}
+                                    className="text-xs bg-red-900/30 hover:bg-red-900/50 px-2 py-1 rounded transition"
+                                    title="Очистить фильтр"
+                                >
+                                    ✕
+                                </button>
+                            </div>
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -710,15 +830,16 @@ export default function Home() {
                             <div>
                                 📁 Проект: <strong>{activeProject.name}</strong> |
                                 🤖 Роль: <strong>{AI_ROLES[activeProject.role]?.split(' - ')[0] || activeProject.role}</strong> |
-                                📄 Документов: <strong>{projectDocuments.length}</strong>
+                                📄 Документов: <strong>{projectDocuments.length}</strong> |
+                                💬 Сообщений: <strong>{messages.length}</strong>
                                 {webSearchEnabled && ' | 🌐 Web: ON'}
                             </div>
                             <button
                                 onClick={clearChat}
-                                className="text-gray-400 hover:text-white transition"
-                                title="Очистить чат"
+                                className="text-gray-400 hover:text-white transition text-xs"
+                                title="Очистить чат этого проекта"
                             >
-                                🗑️
+                                🗑️ Очистить чат
                             </button>
                         </div>
 
@@ -734,31 +855,7 @@ export default function Home() {
                                 </div>
                             ) : (
                                 messages.map((msg, idx) => (
-                                    <div
-                                        key={idx}
-                                        className={`p-3 rounded-lg ${
-                                            msg.role === 'user'
-                                                ? 'bg-blue-900 ml-auto max-w-[80%]'
-                                                : 'bg-gray-700 mr-auto max-w-[80%]'
-                                        }`}
-                                    >
-                                        <p className="text-sm font-semibold mb-1">
-                                            {msg.role === 'user' ? '👤 Вы' : '🤖 Ассистент'}
-                                        </p>
-                                        <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-
-                                        {/* Показываем источники для ответов AI */}
-                                        {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && (
-                                            <div className="text-xs text-gray-400 mt-2 pt-2 border-t border-gray-600">
-                                                📌 Источники:
-                                                {msg.sources.map((s: any, i: number) => (
-                                                    <div key={i} className="ml-2">
-                                                        • {s.quote?.substring(0, 100)}...
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
+                                    <MessageItem key={idx} msg={msg} />
                                 ))
                             )}
                         </div>

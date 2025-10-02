@@ -36,65 +36,49 @@ function dedupeAndMerge(matches: any[]) {
 
 function cleanAndParseJSON(raw: string): any {
   try {
-    // Удаляем markdown блоки кода и пробелы
+    // Сначала пробуем распарсить как есть
+    return JSON.parse(raw);
+  } catch (e) {
+    // Если не получилось - чистим
     let cleaned = raw
         .replace(/```json\s*/gi, '')
         .replace(/```\s*/gi, '')
         .trim();
 
-    // Находим начало JSON (первая { или [)
+    // Ищем первый { или [
     const jsonStart = cleaned.search(/[\{\[]/);
     if (jsonStart > 0) {
       cleaned = cleaned.substring(jsonStart);
     }
 
-    // Находим конец JSON
-    let depth = 0;
-    let inString = false;
-    let escapeNext = false;
-    let jsonEnd = -1;
-
-    for (let i = 0; i < cleaned.length; i++) {
-      const char = cleaned[i];
-
-      if (escapeNext) {
-        escapeNext = false;
-        continue;
-      }
-
-      if (char === '\\') {
-        escapeNext = true;
-        continue;
-      }
-
-      if (char === '"' && !escapeNext) {
-        inString = !inString;
-        continue;
-      }
-
-      if (!inString) {
-        if (char === '{' || char === '[') {
-          depth++;
-        } else if (char === '}' || char === ']') {
-          depth--;
-          if (depth === 0) {
-            jsonEnd = i + 1;
-            break;
-          }
-        }
-      }
-    }
+    // Пробуем найти последний } или ]
+    let lastBrace = cleaned.lastIndexOf('}');
+    let lastBracket = cleaned.lastIndexOf(']');
+    let jsonEnd = Math.max(lastBrace, lastBracket);
 
     if (jsonEnd > 0) {
-      cleaned = cleaned.substring(0, jsonEnd);
+      cleaned = cleaned.substring(0, jsonEnd + 1);
     }
 
-    // Пробуем распарсить
-    return JSON.parse(cleaned);
-  } catch (e) {
-    console.error('Failed to parse JSON:', e);
-    console.log('Raw string was:', raw.substring(0, 500));
-    return null;
+    try {
+      return JSON.parse(cleaned);
+    } catch (e2) {
+      console.error('Failed to parse even after cleaning:', e2);
+      console.log('Cleaned string was:', cleaned.substring(0, 500));
+
+      // Возвращаем хотя бы текст ответа
+      const answerMatch = cleaned.match(/"answer"\s*:\s*"([^"]+)"/);
+      if (answerMatch) {
+        return {
+          answer: answerMatch[1].replace(/\\n/g, '\n'),
+          citations: [],
+          insights: [],
+          follow_up_questions: []
+        };
+      }
+
+      return null;
+    }
   }
 }
 
@@ -122,10 +106,11 @@ export async function POST(request: NextRequest) {
       // НОВЫЕ параметры
       clarificationAnswers,  // Ответы на уточнения
       skipClarification,     // Пропустить уточнения
-      webSearchEnabled,      // Включен ли web search
-      forceWebSearch        // Принудительный web search
+      searchMode,            // web/academic/sec
+      domainFilter,          // Фильтр доменов
     } = body;
-
+    let webSearchEnabled = body.webSearchEnabled;
+    let forceWebSearch = body.forceWebSearch;
     if (!question?.trim()) {
       return NextResponse.json({ error: "Вопрос не предоставлен" }, { status: 400 });
     }
@@ -222,31 +207,49 @@ export async function POST(request: NextRequest) {
       console.log('Обогащенный вопрос:', finalQuestion);
 
       // Проверяем, не включил ли пользователь web search через уточнения
-      if (clarificationAnswers.enable_web_search === true) {
-        body.webSearchEnabled = true;
+      if (clarificationAnswers.search_web === true || clarificationAnswers.enable_web_search === true) {
+        webSearchEnabled = true;
+        forceWebSearch = true;
+        console.log('Web search включен через уточнения');
       }
     }
 
     // ================== SMART WEB SEARCH ==================
     // Определяем, нужен ли web search
-    const needsWeb = webSearchEnabled
-        ? forceWebSearch || shouldSearchWeb(finalQuestion, chunks, false)
-        : shouldSearchWeb(finalQuestion, chunks, false);
+    const needsWeb = webSearchEnabled && (
+        forceWebSearch ||
+        shouldSearchWeb(finalQuestion, chunks, false) ||
+        chunks.length === 0
+    );
 
-    if (needsWeb || (webSearchEnabled && chunks.length === 0)) {
+    if (needsWeb) {
       console.log('🌐 Выполняем web search...');
 
       try {
+        // Парсим domain filter
+        const domainFilterArray = domainFilter
+          ? domainFilter.split(',').map((d: string) => d.trim()).filter(Boolean)
+          : undefined;
+
         const webEnrichment = await enrichWithWebSearch(
             finalQuestion,
             chunks,
             {
-              searchRecencyFilter: detectTimeFilter(finalQuestion)
+              searchRecencyFilter: detectTimeFilter(finalQuestion),
+              searchMode: searchMode || 'web',
+              searchDomainFilter: domainFilterArray,
+              role: role,
+              returnImages: true,
+              returnRelated: true
             }
         );
 
         webContext = webEnrichment;
-        console.log('✅ Web search завершен, найдено источников:', webEnrichment.webSources?.length || 0);
+        console.log('✅ Web search завершен');
+        console.log(`   - Источников: ${webEnrichment.webSources?.length || 0}`);
+        console.log(`   - Изображений: ${webEnrichment.webImages?.length || 0}`);
+        console.log(`   - Связанных вопросов: ${webEnrichment.relatedQuestions?.length || 0}`);
+        console.log(`   - Модель: ${webEnrichment.model}`);
       } catch (webError) {
         console.error('⚠️ Web search failed:', webError);
         // Продолжаем без web context
@@ -300,7 +303,7 @@ export async function POST(request: NextRequest) {
     const raw = await chatWithProvider(providerFinal, {
       system: systemPrompt,
       user: userPrompt,
-      maxTokens: 4000
+      maxTokens: 8000
     });
 
     console.log(`Raw ответ (первые 200 символов):`, raw.substring(0, 200));
@@ -327,13 +330,20 @@ export async function POST(request: NextRequest) {
       quote: c.text.slice(0, 200)
     }));
 
-    // Добавляем web источники если есть
+    // Добавляем web источники и дополнительные данные если есть
     const webSources = webContext?.webSources || [];
+    const webImages = webContext?.webImages || [];
+    const relatedQuestions = webContext?.relatedQuestions || [];
 
     const insights = parsed.insights || [];
-    const follow_up_questions = parsed.follow_up_questions || [];
 
-    console.log(`Ответ получен. Answer: ${answer.length} chars, Web sources: ${webSources.length}`);
+    // Объединяем follow_up вопросы из модели и из Perplexity
+    let follow_up_questions = parsed.follow_up_questions || [];
+    if (relatedQuestions.length > 0) {
+      follow_up_questions = [...follow_up_questions, ...relatedQuestions].slice(0, 5);
+    }
+
+    console.log(`Ответ получен. Answer: ${answer.length} chars, Web sources: ${webSources.length}, Images: ${webImages.length}`);
 
     const latency = Date.now() - t0;
 
@@ -354,11 +364,13 @@ export async function POST(request: NextRequest) {
           provider: providerFinal,
           latency_ms: latency,
           sources: citations,
-          webSources,  // НОВОЕ
+          webSources,
+          webImages,  // НОВОЕ
           insights,
           follow_up_questions,
-          usedWebSearch: !!webContext,  // НОВОЕ
-          hadClarifications: !!clarificationAnswers  // НОВОЕ
+          usedWebSearch: !!webContext,
+          perplexityModel: webContext?.model,  // НОВОЕ
+          hadClarifications: !!clarificationAnswers
         }
       }
     ]);
@@ -368,12 +380,14 @@ export async function POST(request: NextRequest) {
       answer,
       question,
       sources: citations,
-      webSources,  // НОВОЕ: источники из web
+      webSources,
+      webImages,  // НОВОЕ: изображения из web
       insights,
       follow_up_questions,
       provider: providerFinal,
+      perplexityModel: webContext?.model,  // НОВОЕ: модель Perplexity
       latency_ms: latency,
-      usedWebSearch: !!webContext  // НОВОЕ: флаг использования web
+      usedWebSearch: !!webContext
     });
 
   } catch (err: any) {
@@ -383,6 +397,7 @@ export async function POST(request: NextRequest) {
       answer: "Произошла ошибка при обработке запроса. Попробуйте еще раз.",
       sources: [],
       webSources: [],
+      webImages: [],
       insights: [],
       follow_up_questions: []
     }, { status: 500 });

@@ -2,7 +2,7 @@
 
 interface PerplexityConfig {
     apiKey: string;
-    model?: string;
+    model?: 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro';
     maxTokens?: number;
 }
 
@@ -11,56 +11,126 @@ interface SearchOptions {
     returnImages?: boolean;
     returnRelated?: boolean;
     searchRecencyFilter?: 'day' | 'week' | 'month' | 'year';
+    searchMode?: 'web' | 'academic' | 'sec';
+    model?: 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro';
+}
+
+interface WebSource {
+    title?: string;
+    url?: string;
+    snippet?: string;
 }
 
 export class PerplexityClient {
     private apiKey: string;
     private baseUrl = 'https://api.perplexity.ai';
+    private defaultModel: string;
 
     constructor(config: PerplexityConfig) {
         this.apiKey = config.apiKey || process.env.PERPLEXITY_API_KEY!;
+        this.defaultModel = config.model || 'sonar-deep-research';
     }
 
     async search(query: string, options?: SearchOptions) {
         try {
+            const requestBody: any = {
+                model: options?.model || this.defaultModel,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'You are a helpful search assistant. Provide accurate, up-to-date information with detailed sources and citations.'
+                    },
+                    {
+                        role: 'user',
+                        content: query
+                    }
+                ],
+                temperature: 0.2,
+                top_p: 0.9,
+                return_images: options?.returnImages ?? false,
+                return_related_questions: options?.returnRelated ?? true,
+            };
+
+            // Add search mode if specified
+            if (options?.searchMode) {
+                requestBody.search_mode = options.searchMode;
+            }
+
+            // Add recency filter if specified
+            if (options?.searchRecencyFilter) {
+                requestBody.search_recency_filter = options.searchRecencyFilter;
+            }
+
+            // Add domain filter if specified
+            if (options?.searchDomainFilter && options.searchDomainFilter.length > 0) {
+                requestBody.search_domain_filter = options.searchDomainFilter;
+            }
+
             const response = await fetch(`${this.baseUrl}/chat/completions`, {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${this.apiKey}`,
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    model: 'sonar-medium-online',
-                    messages: [
-                        {
-                            role: 'system',
-                            content: 'You are a helpful search assistant. Provide accurate, up-to-date information with sources.'
-                        },
-                        {
-                            role: 'user',
-                            content: query
-                        }
-                    ],
-                    temperature: 0.2,
-                    top_p: 0.9,
-                    search_domain_filter: options?.searchDomainFilter,
-                    return_images: options?.returnImages || false,
-                    return_related_questions: options?.returnRelated || false,
-                    search_recency_filter: options?.searchRecencyFilter
-                })
+                body: JSON.stringify(requestBody)
             });
 
             if (!response.ok) {
+                const errorText = await response.text();
+                console.error('Perplexity error:', errorText);
                 throw new Error(`Perplexity API error: ${response.status}`);
             }
 
             const data = await response.json();
 
+            console.log('Perplexity raw response:', JSON.stringify(data, null, 2));
+
+            // Extract comprehensive metadata
+            const message = data.choices?.[0]?.message;
+
+            // Perplexity API returns citations as an array of URL strings
+            // Format: ["https://example.com", "https://example2.com"]
+            let citations = data.citations || [];
+
+            // Parse sources - Perplexity returns plain URLs
+            const sources: WebSource[] = citations
+                .filter((citation: any) => citation) // Filter out null/undefined
+                .map((url: string, index: number) => {
+                    if (typeof url === 'string' && url.startsWith('http')) {
+                        try {
+                            const urlObj = new URL(url);
+                            const hostname = urlObj.hostname.replace('www.', '');
+
+                            // Create a readable title from hostname
+                            const title = hostname
+                                .split('.')
+                                .slice(0, -1)
+                                .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+                                .join(' ') || hostname;
+
+                            return {
+                                title: title,
+                                url: url,
+                                snippet: '' // Perplexity doesn't provide snippets in citations
+                            };
+                        } catch (e) {
+                            console.error('Error parsing citation URL:', url, e);
+                            return null;
+                        }
+                    }
+                    return null;
+                })
+                .filter((source): source is WebSource => source !== null && !!source.url);
+
+            console.log('Parsed sources:', sources);
+
             return {
-                answer: data.choices[0].message.content,
-                sources: data.sources || [],
+                answer: message?.content || '',
+                sources,
                 images: data.images || [],
-                relatedQuestions: data.related_questions || []
+                relatedQuestions: data.related_questions || [],
+                model: requestBody.model,
+                usage: data.usage || {}
             };
         } catch (error) {
             console.error('Perplexity search error:', error);
@@ -112,23 +182,66 @@ export function shouldSearchWeb(
 export async function enrichWithWebSearch(
     question: string,
     documentContext: any[],
-    options?: SearchOptions
+    options?: SearchOptions & { role?: string }
 ): Promise<any> {
+    // Выбираем модель в зависимости от роли
+    const modelForRole = selectModelForRole(options?.role);
+
     const client = new PerplexityClient({
-        apiKey: process.env.PERPLEXITY_API_KEY!
+        apiKey: process.env.PERPLEXITY_API_KEY!,
+        model: modelForRole
     });
 
-    // Формируем контекстный запрос
-    const contextualQuery = `${question}. Context: Working with documents about ${extractTopics(documentContext).join(', ')}.`;
+    // Формируем контекстный запрос с учетом контекста документов
+    let contextualQuery = question;
 
-    const webResults = await client.search(contextualQuery, options);
+    if (documentContext.length > 0) {
+        const topics = extractTopics(documentContext);
+        if (topics.length > 0) {
+            contextualQuery = `${question}\n\nContext: Analysis related to ${topics.join(', ')}.`;
+        }
+    }
+
+    // Выполняем поиск с расширенными параметрами
+    const searchOptions: SearchOptions = {
+        ...options,
+        returnImages: options?.returnImages ?? true,
+        returnRelated: options?.returnRelated ?? true,
+        model: modelForRole
+    };
+
+    const webResults = await client.search(contextualQuery, searchOptions);
 
     return {
         webAnswer: webResults.answer,
         webSources: webResults.sources,
+        webImages: webResults.images || [],
+        relatedQuestions: webResults.relatedQuestions || [],
         combinedContext: mergeContexts(documentContext, webResults),
-        confidence: calculateCombinedConfidence(documentContext, webResults)
+        confidence: calculateCombinedConfidence(documentContext, webResults),
+        model: webResults.model,
+        usage: webResults.usage
     };
+}
+
+// Выбор модели в зависимости от роли AI
+function selectModelForRole(role?: string): 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro' {
+    if (!role) return 'sonar-deep-research';
+
+    const roleLower = role.toLowerCase();
+
+    // CFO, Analyst, Lawyer требуют глубокого анализа
+    if (roleLower.includes('cfo') || roleLower.includes('analyst') || roleLower.includes('lawyer')) {
+        return 'sonar-deep-research';
+    }
+
+    // Investor требует reasoning для оценки потенциала
+    if (roleLower.includes('investor')) {
+        return 'sonar-reasoning-pro';
+    }
+
+    // По умолчанию используем deep research
+    return 'sonar-deep-research';
 }
 
 function extractTopics(context: any[]): string[] {
