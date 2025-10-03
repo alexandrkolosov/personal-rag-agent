@@ -1,25 +1,21 @@
 'use client';
 
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '../lib/supabase-browser';
 import { useRouter } from 'next/navigation';
 import { useDebounce } from '../hooks/useDebounce';
-import MessageItem from './components/MessageItem';
-import ComparisonResults from './components/ComparisonResults';
 import { exportToMarkdown, exportToCSV, exportToDocx, downloadFile, exportComparisonToMarkdown } from '../lib/exportUtils';
 
-const supabase = createClient();
+// Components
+import ToastNotification from './components/shared/ToastNotification';
+import ProjectModal, { AI_ROLES } from './components/modals/ProjectModal';
+import TopBar from './components/layout/TopBar';
+import SearchSettingsPanel from './components/search/SearchSettingsPanel';
+import DocumentPanel from './components/documents/DocumentPanel';
+import ChatWindow from './components/chat/ChatWindow';
+import ComparisonResults from './components/ComparisonResults';
 
-// Роли для AI
-const AI_ROLES = {
-    analyst: "🧠 Аналитик - критический анализ и поиск рисков",
-    cfo: "💰 CFO - фокус на финансах и метриках",
-    lawyer: "⚖️ Юрист - правовые риски и формулировки",
-    investor: "🚀 Инвестор - оценка потенциала и масштабируемости",
-    custom: "✏️ Своя роль"
-};
+const supabase = createClient();
 
 export default function Home() {
     // Основные стейты пользователя
@@ -724,459 +720,99 @@ export default function Home() {
     return (
         <main className="min-h-screen bg-warm-50 text-warm-800">
             {/* Toast Notification */}
-            {showCacheNotification && (
-                <div className="fixed top-4 right-4 z-50 animate-fade-in">
-                    <div className="bg-white border border-warm-200 rounded-lg px-4 py-3 max-w-md shadow-sm">
-                        <p className="text-sm text-warm-700">{cacheNotificationMessage}</p>
-                    </div>
-                </div>
-            )}
+            <ToastNotification
+                show={showCacheNotification}
+                message={cacheNotificationMessage}
+            />
 
             {/* Верхняя панель с проектами */}
-            <div className="bg-white border-b border-warm-200 px-4 py-3">
-                <div className="flex items-center justify-between max-w-7xl mx-auto">
-                    {/* Селектор проектов */}
-                    <div className="flex items-center gap-4">
-                        <select
-                            value={activeProject?.id || ''}
-                            onChange={(e) => {
-                                const project = projects.find(p => p.id === e.target.value);
-                                setActiveProject(project);
-                            }}
-                            className="bg-white text-warm-800 px-3 py-1.5 rounded-lg border border-warm-200 focus:border-accent-400 focus:outline-none transition-colors text-sm"
-                        >
-                            <option value="">Выберите проект</option>
-                            {projects.map(p => (
-                                <option key={p.id} value={p.id}>
-                                    📁 {p.name}
-                                </option>
-                            ))}
-                        </select>
-
-                        <button
-                            onClick={() => setShowProjectModal(true)}
-                            className="bg-accent-500 hover:bg-accent-600 text-white px-4 py-1.5 rounded-lg text-sm font-normal transition-colors"
-                        >
-                            ➕ Новый проект
-                        </button>
-
-                        {activeProject && (
-                            <div className="flex items-center gap-2 ml-4 text-warm-600">
-                                <span className="text-sm">Роль AI:</span>
-                                <span className="text-warm-800 font-semibold">
-                                    {AI_ROLES[activeProject.role as keyof typeof AI_ROLES]?.split(' - ')[0] || activeProject.role}
-                                </span>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Кнопки экспорта и выход */}
-                    <div className="flex items-center gap-4">
-                        <div className="flex items-center gap-2">
-                            <button
-                                onClick={() => exportChat('markdown')}
-                                className="text-gray-400 hover:text-white px-3 py-1 transition"
-                                title="Экспорт в Markdown"
-                            >
-                                📝 MD
-                            </button>
-                            <button
-                                onClick={() => exportChat('csv')}
-                                className="text-gray-400 hover:text-white px-3 py-1 transition"
-                                title="Экспорт в CSV"
-                            >
-                                📊 CSV
-                            </button>
-                            <button
-                                onClick={() => exportChat('docx')}
-                                className="text-gray-400 hover:text-white px-3 py-1 transition"
-                                title="Экспорт в Word"
-                            >
-                                📄 Word
-                            </button>
-                        </div>
-
-                        <div className="flex items-center gap-4">
-                            <span className="text-sm text-gray-400">{user.email}</span>
-                            <button
-                                onClick={handleLogout}
-                                className="text-red-400 hover:text-red-300 transition"
-                            >
-                                Выйти
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
+            <TopBar
+                projects={projects}
+                activeProject={activeProject}
+                user={user}
+                onProjectChange={(projectId) => {
+                    const project = projects.find(p => p.id === projectId);
+                    setActiveProject(project);
+                }}
+                onNewProject={() => setShowProjectModal(true)}
+                onExport={exportChat}
+                onLogout={handleLogout}
+            />
 
             {/* НОВОЕ: Панель настроек поиска */}
-            <div className="bg-warm-50 border-b border-warm-200 px-4 py-2">
-                <div className="max-w-7xl mx-auto">
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-4 flex-wrap">
-                            <label className="flex items-center gap-2 text-sm">
-                                <input
-                                    type="checkbox"
-                                    checked={webSearchEnabled}
-                                    onChange={(e) => setWebSearchEnabled(e.target.checked)}
-                                    className="rounded"
-                                />
-                                <span>🌐 Web Search</span>
-                            </label>
-
-                            <label className="flex items-center gap-2 text-sm">
-                                <input
-                                    type="checkbox"
-                                    checked={comparisonMode}
-                                    onChange={(e) => {
-                                        setComparisonMode(e.target.checked);
-                                        if (!e.target.checked) {
-                                            setSelectedDocsForComparison([]);
-                                        }
-                                    }}
-                                    className="rounded"
-                                />
-                                <span>📊 Сравнение документов</span>
-                            </label>
-
-                            {webSearchEnabled && (
-                                <>
-                                    <label className="flex items-center gap-2 text-sm">
-                                        <input
-                                            type="checkbox"
-                                            checked={forceWebSearch}
-                                            onChange={(e) => setForceWebSearch(e.target.checked)}
-                                            className="rounded"
-                                        />
-                                        <span>Всегда искать</span>
-                                    </label>
-
-                                    <button
-                                        onClick={() => setShowAdvancedSearch(!showAdvancedSearch)}
-                                        className="text-sm text-blue-400 hover:text-blue-300 transition"
-                                    >
-                                        ⚙️ {showAdvancedSearch ? 'Скрыть' : 'Расширенные'}
-                                    </button>
-                                </>
-                            )}
-
-                            {/* Clear Memory Button */}
-                            <button
-                                onClick={handleClearCache}
-                                disabled={clearingCache}
-                                className="text-xs px-3 py-1 bg-warm-200 hover:bg-warm-300 disabled:bg-warm-100 disabled:text-warm-400 text-warm-700 rounded-lg transition-colors flex items-center gap-1"
-                                title="Очистить кэш поиска для получения свежих результатов"
-                            >
-                                {clearingCache ? (
-                                    <>🔄 Очистка...</>
-                                ) : (
-                                    <>🧹 Очистить память</>
-                                )}
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* Расширенные настройки */}
-                    {webSearchEnabled && showAdvancedSearch && (
-                        <div className="mt-2 pt-2 border-t border-warm-200 flex gap-4 flex-wrap items-center">
-                            {/* Режим поиска */}
-                            <div className="flex items-center gap-2 text-xs">
-                                <label className="text-warm-600">Режим:</label>
-                                <select
-                                    value={searchMode}
-                                    onChange={(e) => setSearchMode(e.target.value as 'web' | 'academic' | 'sec')}
-                                    className="bg-white text-warm-800 px-2 py-1 rounded-lg border border-warm-200 text-xs"
-                                >
-                                    <option value="web">🌐 Web (Общий)</option>
-                                    <option value="academic">🎓 Academic (Научный)</option>
-                                    <option value="sec">📊 SEC (Финансовые отчеты)</option>
-                                </select>
-                            </div>
-
-                            {/* Фильтр доменов */}
-                            <div className="flex items-center gap-2 text-sm flex-1 min-w-[300px]">
-                                <label className="text-warm-600">Домены:</label>
-                                <input
-                                    type="text"
-                                    placeholder="example.com, scholar.google.com"
-                                    value={domainFilter}
-                                    onChange={(e) => setDomainFilter(e.target.value)}
-                                    className="flex-1 bg-white text-warm-800 px-2 py-1 rounded-lg border border-warm-200 text-xs placeholder-warm-400"
-                                />
-                            </div>
-
-                            {/* Предустановки */}
-                            <div className="flex gap-2">
-                                <button
-                                    onClick={() => setDomainFilter('scholar.google.com, arxiv.org, nature.com, science.org')}
-                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
-                                    title="Научные источники"
-                                >
-                                    🎓 Наука
-                                </button>
-                                <button
-                                    onClick={() => setDomainFilter('sec.gov, edgar.gov')}
-                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
-                                    title="SEC финансовые отчеты"
-                                >
-                                    📊 SEC
-                                </button>
-                                <button
-                                    onClick={() => setDomainFilter('reuters.com, bloomberg.com, ft.com')}
-                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
-                                    title="Новостные источники"
-                                >
-                                    📰 Новости
-                                </button>
-                                <button
-                                    onClick={() => setDomainFilter('')}
-                                    className="text-xs bg-red-900/30 hover:bg-red-900/50 px-2 py-1 rounded transition"
-                                    title="Очистить фильтр"
-                                >
-                                    ✕
-                                </button>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            </div>
+            <SearchSettingsPanel
+                webSearchEnabled={webSearchEnabled}
+                comparisonMode={comparisonMode}
+                forceWebSearch={forceWebSearch}
+                showAdvancedSearch={showAdvancedSearch}
+                searchMode={searchMode}
+                domainFilter={domainFilter}
+                clearingCache={clearingCache}
+                onWebSearchChange={setWebSearchEnabled}
+                onComparisonModeChange={(checked) => {
+                    setComparisonMode(checked);
+                    if (!checked) {
+                        setSelectedDocsForComparison([]);
+                    }
+                }}
+                onForceWebSearchChange={setForceWebSearch}
+                onShowAdvancedSearchToggle={() => setShowAdvancedSearch(!showAdvancedSearch)}
+                onSearchModeChange={setSearchMode}
+                onDomainFilterChange={setDomainFilter}
+                onClearCache={handleClearCache}
+            />
 
             {/* Основной контент */}
             {activeProject ? (
                 <div className="max-w-7xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
                     {/* Левая панель - документы */}
-                    <div className="lg:col-span-1 space-y-4">
-                        {/* Загрузка файлов */}
-                        <div className="bg-white rounded-lg border border-warm-200 p-4">
-                            <h3 className="font-medium text-warm-800 mb-3 text-sm">📎 Документы проекта</h3>
-                            <input
-                                id="fileInput"
-                                type="file"
-                                onChange={handleFileChange}
-                                className="block w-full mb-2 text-xs text-warm-700 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-warm-200 file:text-xs file:bg-warm-50 file:text-warm-700 hover:file:bg-warm-100 file:transition-colors"
-                                accept=".txt,.docx,.xlsx,.xls,.csv"
-                            />
-                            <div className="text-xs text-warm-500 mb-2">
-                                Поддерживаются: DOCX, TXT, XLSX, XLS, CSV
-                            </div>
-                            <button
-                                onClick={handleUpload}
-                                disabled={!file || uploading}
-                                className="w-full bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 rounded-lg text-sm font-normal transition-colors"
-                            >
-                                {uploading ? '⏳ Загрузка...' : '📤 Загрузить'}
-                            </button>
-
-                            {uploadStatus && (
-                                <div className={`mt-2 p-2 rounded-lg text-xs border ${
-                                    uploadStatus.includes('❌')
-                                        ? 'bg-red-50 text-red-600 border-red-200'
-                                        : 'bg-green-50 text-green-600 border-green-200'
-                                }`}>
-                                    {uploadStatus}
-                                </div>
-                            )}
-
-                            {/* Авто-саммари при загрузке */}
-                            <label className="flex items-center gap-2 mt-3 text-xs text-warm-700">
-                                <input
-                                    type="checkbox"
-                                    checked={autoSummary}
-                                    onChange={(e) => setAutoSummary(e.target.checked)}
-                                    className="rounded"
-                                />
-                                Создавать саммари при загрузке
-                            </label>
-                        </div>
-
-                        {/* Список документов */}
-                        <div className="bg-white rounded-lg border border-warm-200 p-4">
-                            <div className="flex justify-between items-center mb-3">
-                                <h3 className="font-medium text-warm-800 text-sm">
-                                    Файлы ({projectDocuments.length})
-                                </h3>
-                                <button
-                                    onClick={() => loadDocuments()}
-                                    disabled={loadingDocs}
-                                    className="text-xs text-accent-600 hover:text-accent-700"
-                                >
-                                    {loadingDocs ? '⏳' : '🔄'}
-                                </button>
-                            </div>
-
-                            <div className="max-h-96 overflow-y-auto space-y-2">
-                                {projectDocuments.length === 0 ? (
-                                    <p className="text-warm-400 text-center py-4 text-xs">
-                                        Документы еще не загружены
-                                    </p>
-                                ) : (
-                                    projectDocuments.map(doc => (
-                                        <div key={doc.id} className="p-2 bg-warm-50 rounded-lg border border-warm-200 hover:bg-warm-100 transition-colors">
-                                            <div className="flex justify-between items-start">
-                                                {comparisonMode && (
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={selectedDocsForComparison.includes(doc.id)}
-                                                        onChange={(e) => {
-                                                            if (e.target.checked) {
-                                                                if (selectedDocsForComparison.length >= 5) {
-                                                                    alert('Максимум 5 документов для сравнения');
-                                                                    return;
-                                                                }
-                                                                setSelectedDocsForComparison([...selectedDocsForComparison, doc.id]);
-                                                            } else {
-                                                                setSelectedDocsForComparison(selectedDocsForComparison.filter(id => id !== doc.id));
-                                                            }
-                                                        }}
-                                                        className="mr-2 mt-1"
-                                                    />
-                                                )}
-                                                <div className="flex-1 min-w-0">
-                                                    <p className="text-xs font-normal truncate text-warm-800">
-                                                        📄 {doc.filename}
-                                                        {doc.doc_type && doc.doc_type !== 'general' && (
-                                                            <span className="ml-2 text-[10px] px-1.5 py-0.5 bg-info/10 text-info rounded">
-                                                                {doc.doc_type}
-                                                            </span>
-                                                        )}
-                                                    </p>
-                                                    <p className="text-[10px] text-warm-500 mt-0.5">
-                                                        {formatFileSize(doc.file_size)} • {formatDate(doc.created_at)}
-                                                    </p>
-                                                </div>
-                                                <button
-                                                    onClick={() => handleDeleteDocument(doc.id)}
-                                                    className="ml-2 text-red-500 hover:text-red-600 text-xs transition-colors"
-                                                >
-                                                    🗑️
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ))
-                                )}
-                            </div>
-
-                            {/* Кнопка сравнения документов */}
-                            {comparisonMode && selectedDocsForComparison.length >= 2 && (
-                                <div className="mt-4 space-y-2">
-                                    <button
-                                        onClick={() => handleCompareDocuments('semantic')}
-                                        disabled={comparing}
-                                        className="w-full bg-info hover:bg-info/90 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 px-3 rounded-lg text-sm font-normal transition-colors"
-                                    >
-                                        {comparing ? '⏳ Сравнение...' : `⚡ Быстрое сравнение (${selectedDocsForComparison.length} док.)`}
-                                    </button>
-                                    <button
-                                        onClick={() => handleCompareDocuments('ai_powered')}
-                                        disabled={comparing}
-                                        className="w-full bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 px-3 rounded-lg text-sm font-normal transition-colors"
-                                    >
-                                        {comparing ? '⏳ Сравнение...' : `🤖 AI-анализ (${selectedDocsForComparison.length} док.)`}
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    </div>
+                    <DocumentPanel
+                        file={file}
+                        uploading={uploading}
+                        uploadStatus={uploadStatus}
+                        autoSummary={autoSummary}
+                        documents={projectDocuments}
+                        loadingDocs={loadingDocs}
+                        comparisonMode={comparisonMode}
+                        selectedDocs={selectedDocsForComparison}
+                        comparing={comparing}
+                        onFileChange={handleFileChange}
+                        onUpload={handleUpload}
+                        onAutoSummaryChange={setAutoSummary}
+                        onRefresh={loadDocuments}
+                        onDocSelect={(docId, checked) => {
+                            if (checked) {
+                                if (selectedDocsForComparison.length >= 5) {
+                                    alert('Максимум 5 документов для сравнения');
+                                    return;
+                                }
+                                setSelectedDocsForComparison([...selectedDocsForComparison, docId]);
+                            } else {
+                                setSelectedDocsForComparison(selectedDocsForComparison.filter(id => id !== docId));
+                            }
+                        }}
+                        onDocDelete={handleDeleteDocument}
+                        onCompare={handleCompareDocuments}
+                        formatFileSize={formatFileSize}
+                        formatDate={formatDate}
+                    />
 
                     {/* Центр - чат */}
-                    <div className="lg:col-span-2 bg-white rounded-lg border border-warm-200 p-4 flex flex-col h-[calc(100vh-180px)]">
-                        {/* Контекстная строка */}
-                        <div className="bg-warm-50 border border-warm-200 rounded-lg p-2 mb-3 text-xs flex justify-between items-center">
-                            <div>
-                                📁 Проект: <strong>{activeProject.name}</strong> |
-                                🤖 Роль: <strong>{AI_ROLES[activeProject.role as keyof typeof AI_ROLES]?.split(' - ')[0] || activeProject.role}</strong> |
-                                📄 Документов: <strong>{projectDocuments.length}</strong> |
-                                💬 Сообщений: <strong>{messages.length}</strong>
-                                {webSearchEnabled && ' | 🌐 Web: ON'} | 💾 Cache: ON | ⏱️ Throttled
-                            </div>
-                            <div className="flex gap-2">
-                                {messages.length > 0 && (
-                                    <>
-                                        <button
-                                            onClick={() => exportChat('markdown')}
-                                            className="text-gray-400 hover:text-white transition text-xs"
-                                            title="Экспорт в Markdown"
-                                        >
-                                            📥 MD
-                                        </button>
-                                        <button
-                                            onClick={() => exportChat('csv')}
-                                            className="text-gray-400 hover:text-white transition text-xs"
-                                            title="Экспорт в CSV"
-                                        >
-                                            📥 CSV
-                                        </button>
-                                        <button
-                                            onClick={() => exportChat('docx')}
-                                            className="text-gray-400 hover:text-white transition text-xs"
-                                            title="Экспорт в Word"
-                                        >
-                                            📥 DOCX
-                                        </button>
-                                    </>
-                                )}
-                                <button
-                                    onClick={clearChat}
-                                    className="text-gray-400 hover:text-white transition text-xs"
-                                    title="Очистить чат этого проекта"
-                                >
-                                    🗑️
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Сообщения */}
-                        <div className="flex-1 overflow-y-auto mb-3 space-y-3">
-                            {messages.length === 0 ? (
-                                <div className="text-center py-12">
-                                    <p className="text-warm-500 text-sm">
-                                        {projectDocuments.length > 0
-                                            ? "✅ RAG активирован! Задавайте вопросы по документам"
-                                            : "Загрузите документы и начните задавать вопросы"}
-                                    </p>
-                                </div>
-                            ) : (
-                                messages.map((msg, idx) => (
-                                    <MessageItem key={idx} msg={msg} />
-                                ))
-                            )}
-                        </div>
-
-                        {/* Предложенные вопросы от AI */}
-                        {suggestedQuestions.length > 0 && (
-                            <div className="flex gap-1.5 mb-2 flex-wrap">
-                                {suggestedQuestions.map((q, idx) => (
-                                    <button
-                                        key={idx}
-                                        onClick={() => setQuestion(q)}
-                                        className="text-[10px] bg-warm-50 hover:bg-warm-100 text-warm-600 px-2 py-1 rounded border border-warm-200 transition-colors"
-                                    >
-                                        💡 {q}
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-
-                        {/* Ввод */}
-                        <div className="flex gap-2">
-                            <input
-                                type="text"
-                                value={question}
-                                onChange={(e) => setQuestion(e.target.value)}
-                                onKeyPress={(e) => e.key === 'Enter' && !asking && handleAsk()}
-                                placeholder="Задайте вопрос о документах..."
-                                className="flex-1 bg-white text-warm-800 placeholder-warm-400 px-4 py-2 rounded-lg border border-warm-200 focus:border-accent-400 focus:outline-none transition-colors text-sm"
-                                disabled={asking}
-                            />
-                            <button
-                                onClick={handleAsk}
-                                disabled={!question.trim() || asking}
-                                className="bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm transition-colors"
-                            >
-                                {asking ? '⏳' : '📤'}
-                            </button>
-                        </div>
-                    </div>
+                    <ChatWindow
+                        projectName={activeProject.name}
+                        projectRole={AI_ROLES[activeProject.role as keyof typeof AI_ROLES]?.split(' - ')[0] || activeProject.role}
+                        documentCount={projectDocuments.length}
+                        messages={messages}
+                        suggestedQuestions={suggestedQuestions}
+                        question={question}
+                        asking={asking}
+                        webSearchEnabled={webSearchEnabled}
+                        onQuestionChange={setQuestion}
+                        onSubmit={handleAsk}
+                        onExport={exportChat}
+                        onClearChat={clearChat}
+                        onSuggestedQuestionClick={setQuestion}
+                    />
                 </div>
             ) : (
                 <div className="flex items-center justify-center h-[calc(100vh-120px)]">
@@ -1194,64 +830,22 @@ export default function Home() {
             )}
 
             {/* Модалка создания проекта */}
-            {showProjectModal && (
-                <div className="fixed inset-0 bg-black/20 flex items-center justify-center z-50">
-                    <div className="bg-white p-6 rounded-lg w-96 shadow-lg border border-warm-200">
-                        <h2 className="text-xl mb-4">Новый проект</h2>
-
-                        <input
-                            type="text"
-                            placeholder="Название проекта"
-                            value={newProjectName}
-                            onChange={(e) => setNewProjectName(e.target.value)}
-                            className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mb-3 focus:border-accent-400 focus:outline-none text-sm"
-                        />
-
-                        <label className="block mb-3">
-                            <span className="text-sm text-warm-600">Роль AI:</span>
-                            <select
-                                value={selectedRole}
-                                onChange={(e) => setSelectedRole(e.target.value)}
-                                className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mt-1 focus:border-accent-400 focus:outline-none text-sm"
-                            >
-                                {Object.entries(AI_ROLES).map(([key, value]) => (
-                                    <option key={key} value={key}>{value}</option>
-                                ))}
-                            </select>
-                        </label>
-
-                        {selectedRole === 'custom' && (
-                            <textarea
-                                placeholder="Опишите роль AI..."
-                                value={customRole}
-                                onChange={(e) => setCustomRole(e.target.value)}
-                                className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mb-3 h-20 focus:border-accent-400 focus:outline-none text-sm"
-                            />
-                        )}
-
-                        <div className="flex gap-2">
-                            <button
-                                onClick={createProject}
-                                disabled={!newProjectName.trim()}
-                                className="flex-1 bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 rounded-lg text-sm font-normal transition-colors"
-                            >
-                                Создать
-                            </button>
-                            <button
-                                onClick={() => {
-                                    setShowProjectModal(false);
-                                    setNewProjectName('');
-                                    setSelectedRole('analyst');
-                                    setCustomRole('');
-                                }}
-                                className="flex-1 bg-warm-300 hover:bg-warm-400 text-warm-700 py-2 rounded-lg text-sm font-normal transition-colors"
-                            >
-                                Отмена
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            <ProjectModal
+                show={showProjectModal}
+                projectName={newProjectName}
+                selectedRole={selectedRole}
+                customRole={customRole}
+                onProjectNameChange={setNewProjectName}
+                onRoleChange={setSelectedRole}
+                onCustomRoleChange={setCustomRole}
+                onCreate={createProject}
+                onClose={() => {
+                    setShowProjectModal(false);
+                    setNewProjectName('');
+                    setSelectedRole('analyst');
+                    setCustomRole('');
+                }}
+            />
 
             {/* НОВОЕ: Модалка уточнений */}
             {clarificationMode && (
