@@ -14,6 +14,8 @@ import {
   shouldSearchWeb,
   enrichWithWebSearch
 } from "../../../lib/perplexity";
+// Query optimization removed - sending queries unchanged to Perplexity
+import { enhancePrompt } from "../../../lib/promptEnhancer";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -92,10 +94,10 @@ export async function POST(request: NextRequest) {
     );
 
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
-    if (!token) return NextResponse.json({ error: "Не авторизован" }, { status: 401 });
+    if (!token) return NextResponse.json({error: "Не авторизован"}, {status: 401});
 
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) return NextResponse.json({ error: "Не авторизован" }, { status: 401 });
+    const {data: {user}, error: authError} = await supabase.auth.getUser(token);
+    if (authError || !user) return NextResponse.json({error: "Не авторизован"}, {status: 401});
 
     const body = await request.json();
     const {
@@ -112,23 +114,40 @@ export async function POST(request: NextRequest) {
     let webSearchEnabled = body.webSearchEnabled;
     let forceWebSearch = body.forceWebSearch;
     if (!question?.trim()) {
-      return NextResponse.json({ error: "Вопрос не предоставлен" }, { status: 400 });
+      return NextResponse.json({error: "Вопрос не предоставлен"}, {status: 400});
     }
 
     console.log(`Вопрос: "${question}" | Проект: ${projectId} | Роль: ${role}`);
     console.log(`Web Search: enabled=${webSearchEnabled}, forced=${forceWebSearch}`);
 
+    // ================== PROMPT ENHANCEMENT WITH CLAUDE ==================
+    // For web search: NO enhancement - pass query unchanged
+    let enhancedQuestion = question;
+    let promptEnhancement = null;
+
+    try {
+      promptEnhancement = await enhancePrompt(question, role, {webSearchEnabled});
+      enhancedQuestion = promptEnhancement.enhanced;
+      if (!promptEnhancement.wasImproved) {
+        console.log('✅ Query sent unchanged:', promptEnhancement.improvementReason);
+      }
+    } catch (error) {
+      console.error('⚠️ Prompt enhancement failed, using original:', error);
+      enhancedQuestion = question;
+    }
+
+    // ================== DOCUMENT RETRIEVAL ==================
     // Проверяем количество чанков
     let countQuery = supabase
         .from("doc_chunks")
-        .select("*", { count: "exact", head: true })
+        .select("*", {count: "exact", head: true})
         .eq("user_id", user.id);
 
     if (projectId && projectId !== 'null') {
       countQuery = countQuery.eq("project_id", projectId);
     }
 
-    const { count } = await countQuery;
+    const {count} = await countQuery;
 
     // Получаем релевантные чанки (даже если их 0, для контекста)
     let chunks: any[] = [];
@@ -137,33 +156,76 @@ export async function POST(request: NextRequest) {
     if (count && count > 0) {
       console.log(`Найдено ${count} чанков в проекте`);
 
+      // Определяем модель эмбеддинга на основе документов проекта
+      console.log('Определение модели эмбеддинга...');
+      const {data: projectDocs} = await supabase
+          .from('documents')
+          .select('embedding_model')
+          .eq('user_id', user.id)
+          .eq('project_id', projectId)
+          .limit(1);
+
+      // Используем модель из первого документа проекта или text-embedding-3-large по умолчанию
+      const embeddingModel = projectDocs?.[0]?.embedding_model || 'text-embedding-3-large';
+      console.log(`Используется модель: ${embeddingModel}`);
+
       // Генерация эмбеддинга
       console.log('Генерация эмбеддинга...');
       const embedRes = await openai.embeddings.create({
-        model: "text-embedding-3-small",
-        input: question
+        model: embeddingModel,
+        input: enhancedQuestion  // Use enhanced question for better retrieval
       });
       const queryEmbedding = embedRes.data[0].embedding;
 
-      // Поиск релевантных чанков
-      console.log('Поиск релевантных чанков...');
-      const { data: matches, error: matchError } = await supabase.rpc("match_doc_chunks", {
-        query_embedding: queryEmbedding,
-        match_threshold: 0.25,
-        match_count: 15,
-        filter_user_id: user.id,
-        filter_project_id: projectId && projectId !== 'null' ? projectId : null
-      });
+      // Определяем режим поиска: сравнение документов или обычный вопрос
+      const isComparisonQuery = enhancedQuestion.toLowerCase().includes('сравни') ||
+          question.toLowerCase().includes('compare') ||
+          question.toLowerCase().includes('различия') ||
+          question.toLowerCase().includes('отличия');
 
-      if (!matchError && matches?.length) {
-        const uniq = dedupeAndMerge(matches).slice(0, 10);
-        chunks = uniq.map((m: any) => ({
-          doc_id: m.document_id,
-          chunk_index: m.chunk_index ?? 0,
-          similarity: m.similarity ?? 0,
-          text: (m.chunk_text || "").slice(0, 2000)
-        }));
-        console.log(`Найдено ${chunks.length} релевантных чанков`);
+      if (isComparisonQuery) {
+        // Для сравнения документов: получаем ВСЕ чанки из проекта
+        console.log('Режим сравнения документов: получение всех чанков...');
+        const {data: allChunks, error: chunksError} = await supabase
+            .from('doc_chunks')
+            .select('id, document_id, chunk_text, chunk_index, metadata')
+            .eq('user_id', user.id)
+            .eq('project_id', projectId)
+            .order('document_id', {ascending: true})
+            .order('chunk_index', {ascending: true})
+            .limit(200); // Увеличиваем лимит для сравнения
+
+        if (!chunksError && allChunks?.length) {
+          chunks = allChunks.map((m: any) => ({
+            doc_id: m.document_id,
+            chunk_index: m.chunk_index ?? 0,
+            similarity: 1.0, // Не используем similarity для сравнения
+            text: (m.chunk_text || "").slice(0, 2000),
+            metadata: m.metadata
+          }));
+          console.log(`Получено ${chunks.length} чанков для сравнения документов`);
+        }
+      } else {
+        // Обычный режим: семантический поиск
+        console.log('Поиск релевантных чанков...');
+        const {data: matches, error: matchError} = await supabase.rpc("match_doc_chunks", {
+          query_embedding: queryEmbedding,
+          match_threshold: 0.25, // Понижен порог для лучшего поиска
+          match_count: 30,
+          filter_user_id: user.id,
+          filter_project_id: projectId && projectId !== 'null' ? projectId : null
+        });
+
+        if (!matchError && matches?.length) {
+          const uniq = dedupeAndMerge(matches).slice(0, 30);
+          chunks = uniq.map((m: any) => ({
+            doc_id: m.document_id,
+            chunk_index: m.chunk_index ?? 0,
+            similarity: m.similarity ?? 0,
+            text: (m.chunk_text || "").slice(0, 2000)
+          }));
+          console.log(`Найдено ${chunks.length} релевантных чанков`);
+        }
       }
     }
 
@@ -171,7 +233,7 @@ export async function POST(request: NextRequest) {
     // Проверяем необходимость уточнений (только если не пропущено и нет ответов)
     if (!skipClarification && !clarificationAnswers) {
       const clarificationCheck = analyzeClarificationNeed(
-          question,
+          enhancedQuestion,  // Use enhanced question
           chunks,
           role
       );
@@ -201,9 +263,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Обогащаем вопрос уточнениями если они есть
-    let finalQuestion = question;
+    let finalQuestion = enhancedQuestion;  // Start with enhanced question
     if (clarificationAnswers) {
-      finalQuestion = mergeQuestionWithClarifications(question, clarificationAnswers);
+      finalQuestion = mergeQuestionWithClarifications(enhancedQuestion, clarificationAnswers);
       console.log('Обогащенный вопрос:', finalQuestion);
 
       // Проверяем, не включил ли пользователь web search через уточнения
@@ -214,7 +276,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // ================== SMART WEB SEARCH ==================
+    // ================== SIMPLE WEB SEARCH ==================
     // Определяем, нужен ли web search
     const needsWeb = webSearchEnabled && (
         forceWebSearch ||
@@ -223,13 +285,15 @@ export async function POST(request: NextRequest) {
     );
 
     if (needsWeb) {
-      console.log('🌐 Выполняем web search...');
+      console.log('🌐 Web search enabled');
+      console.log('  📝 Query sent to Perplexity:', finalQuestion);
+      console.log('  🔍 Search mode:', searchMode || 'web');
 
       try {
-        // Парсим domain filter
+        // Simple, direct search with unmodified query
         const domainFilterArray = domainFilter
-          ? domainFilter.split(',').map((d: string) => d.trim()).filter(Boolean)
-          : undefined;
+            ? domainFilter.split(',').map((d: string) => d.trim()).filter(Boolean)
+            : undefined;
 
         const webEnrichment = await enrichWithWebSearch(
             finalQuestion,
@@ -238,21 +302,23 @@ export async function POST(request: NextRequest) {
               searchRecencyFilter: detectTimeFilter(finalQuestion),
               searchMode: searchMode || 'web',
               searchDomainFilter: domainFilterArray,
-              role: role,
               returnImages: true,
               returnRelated: true
             }
         );
-
         webContext = webEnrichment;
-        console.log('✅ Web search завершен');
-        console.log(`   - Источников: ${webEnrichment.webSources?.length || 0}`);
-        console.log(`   - Изображений: ${webEnrichment.webImages?.length || 0}`);
-        console.log(`   - Связанных вопросов: ${webEnrichment.relatedQuestions?.length || 0}`);
-        console.log(`   - Модель: ${webEnrichment.model}`);
-      } catch (webError) {
+        console.log('✅ Web search completed');
+      } catch (webError: any) {
         console.error('⚠️ Web search failed:', webError);
-        // Продолжаем без web context
+
+        // Check if it's a rate limit error
+        const errorMessage = webError instanceof Error ? webError.message : String(webError);
+        if (errorMessage.includes('rate limit')) {
+          webContext = {
+            rateLimitError: true,
+            errorMessage: 'Perplexity API rate limit exceeded. Continuing with document search only.'
+          };
+        }
       }
     }
 
@@ -322,7 +388,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Извлекаем данные
-    const answer = parsed.answer || "Ошибка: не удалось получить ответ";
+    let answer = parsed.answer || "Ошибка: не удалось получить ответ";
+
+    // Ensure newlines are properly handled in JSON strings
+    if (typeof answer === 'string') {
+      answer = answer.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    }
     const citations = parsed.citations || chunks.slice(0, 3).map(c => ({
       doc_id: c.doc_id,
       chunk_index: c.chunk_index,
@@ -375,10 +446,24 @@ export async function POST(request: NextRequest) {
       }
     ]);
 
+    // Prepare warning message if rate limited or timeouts occurred
+    let warningMessage = undefined;
+    if (webContext?.rateLimitError) {
+      warningMessage = '⚠️ ' + webContext.errorMessage;
+    } else if (webContext?.timeoutWarning) {
+      warningMessage = `⏱️ Note: ${webContext.timeoutWarning}. Results based on successful searches.`;
+    }
+
     // Возвращаем расширенный ответ
     return NextResponse.json({
       answer,
       question,
+      enhancedQuestion: promptEnhancement?.wasImproved ? enhancedQuestion : undefined,  // Show enhanced version if improved
+      promptImprovement: promptEnhancement?.wasImproved ? {
+        original: question,
+        enhanced: enhancedQuestion,
+        reason: promptEnhancement.improvementReason
+      } : undefined,
       sources: citations,
       webSources,
       webImages,  // НОВОЕ: изображения из web
@@ -387,7 +472,8 @@ export async function POST(request: NextRequest) {
       provider: providerFinal,
       perplexityModel: webContext?.model,  // НОВОЕ: модель Perplexity
       latency_ms: latency,
-      usedWebSearch: !!webContext
+      usedWebSearch: !!webContext && !webContext?.rateLimitError,
+      warning: warningMessage
     });
 
   } catch (err: any) {
@@ -437,12 +523,18 @@ function buildEnhancedUserPrompt(
 
   // Добавляем web контекст
   if (webContext) {
-    prompt += '\n\nWEB SEARCH RESULTS (Real-time):\n';
-    prompt += webContext.webAnswer || '';
+    // Check if it's a rate limit error
+    if (webContext.rateLimitError) {
+      prompt += '\n\nWEB SEARCH NOTE:\n';
+      prompt += 'Web search temporarily unavailable due to rate limits. Answer based on documents only.\n';
+    } else {
+      prompt += '\n\nWEB SEARCH RESULTS (Real-time):\n';
+      prompt += webContext.webAnswer || '';
 
-    if (webContext.webSources?.length > 0) {
-      prompt += '\n\nWeb Sources:\n';
-      prompt += webContext.webSources.map((s: any) => `- ${s.title || s.url}`).join('\n');
+      if (webContext.webSources?.length > 0) {
+        prompt += '\n\nWeb Sources:\n';
+        prompt += webContext.webSources.map((s: any) => `- ${s.title || s.url}`).join('\n');
+      }
     }
   }
 

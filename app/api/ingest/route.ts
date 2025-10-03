@@ -1,14 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import * as XLSX from 'xlsx';
+import { analyzeDocument } from '@/lib/documentAnalyzer';
+import { extractChunkMetadata } from '@/lib/metadataExtractor';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 function chunkText(text: string): string[] {
   const chunks: string[] = [];
-  const chunkSize = 1000;
-  const overlap = 200;
+  const chunkSize = 2000;
+  const overlap = 500;
   let startIndex = 0;
 
   while (startIndex < text.length) {
@@ -119,15 +121,17 @@ export async function POST(request: NextRequest) {
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
       'application/vnd.ms-excel', // .xls
       'text/csv', // .csv
+      'application/pdf', // .pdf
     ];
 
     // Проверка по MIME-типу или расширению
     const fileExtension = file.name.toLowerCase().split('.').pop();
     const isExcelFile = fileExtension === 'xlsx' || fileExtension === 'xls' || fileExtension === 'csv';
+    const isPdfFile = fileExtension === 'pdf' || file.type === 'application/pdf';
 
-    if (!allowedTypes.includes(file.type) && !isExcelFile) {
+    if (!allowedTypes.includes(file.type) && !isExcelFile && !isPdfFile) {
       return NextResponse.json({
-        error: 'Поддерживаются только DOCX, TXT, XLSX, XLS и CSV файлы.'
+        error: 'Поддерживаются только DOCX, TXT, XLSX, XLS, CSV и PDF файлы.'
       }, { status: 400 });
     }
 
@@ -155,7 +159,13 @@ export async function POST(request: NextRequest) {
     let parsedText = '';
 
     try {
-      if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      if (file.type === 'application/pdf' || isPdfFile) {
+        // PDF
+        const pdfParse = (await import('pdf-parse')).default;
+        const pdfData = await pdfParse(buffer);
+        parsedText = pdfData.text;
+        console.log(`PDF: ${pdfData.numpages} страниц`);
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
         // DOCX
         const result = await mammoth.extractRawText({ buffer });
         parsedText = result.value;
@@ -201,6 +211,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Документ пустой или слишком короткий' }, { status: 400 });
     }
 
+    // Анализ документа для определения типа и извлечения метаданных
+    console.log('Анализ документа...');
+    const analysis = analyzeDocument(parsedText);
+    console.log(`Тип документа: ${analysis.docType}, Модель: ${analysis.embeddingModel}, Уверенность: ${analysis.confidence}`);
+
     // Сохранение в БД
     console.log('Сохранение в БД...');
     const docToInsert: any = {
@@ -210,6 +225,14 @@ export async function POST(request: NextRequest) {
       file_type: file.type || 'application/octet-stream',
       file_size: file.size,
       content_preview: parsedText.substring(0, 500),
+      doc_type: analysis.docType,
+      embedding_model: analysis.embeddingModel,
+      metadata: {
+        entities: analysis.entities,
+        sections: analysis.sections,
+        keyTerms: analysis.keyTerms,
+        confidence: analysis.confidence
+      }
     };
 
     if (projectId && projectId !== 'null' && projectId !== 'undefined') {
@@ -239,14 +262,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Не удалось создать чанки' }, { status: 500 });
     }
 
-    // Эмбеддинги
-    console.log('Генерация эмбеддингов...');
+    // Эмбеддинги с использованием выбранной модели
+    console.log(`Генерация эмбеддингов с моделью ${analysis.embeddingModel}...`);
     let embeddings: number[][];
 
     try {
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const response = await openai.embeddings.create({
-        model: 'text-embedding-3-small',
+        model: analysis.embeddingModel,
         input: chunks,
       });
       embeddings = response.data.map(item => item.embedding);
@@ -260,16 +283,35 @@ export async function POST(request: NextRequest) {
       }, { status: 500 });
     }
 
-    // Сохранение чанков
-    console.log('Сохранение чанков...');
-    const chunksToInsert = chunks.map((chunk, index) => ({
-      document_id: docData.id,
-      user_id: user.id,
-      project_id: projectId && projectId !== 'null' && projectId !== 'undefined' ? projectId : null,
-      chunk_text: chunk,
-      chunk_index: index,
-      embedding: embeddings[index],
-    }));
+    // Сохранение чанков с метаданными
+    console.log('Сохранение чанков с метаданными...');
+    const isLargeModel = analysis.embeddingModel === 'text-embedding-3-large';
+    console.log(`Модель: ${analysis.embeddingModel}, Использовать large колонку: ${isLargeModel}`);
+
+    const chunksToInsert = chunks.map((chunk, index) => {
+      const chunkMetadata = extractChunkMetadata(chunk, index, analysis.sections);
+
+      const chunkData: any = {
+        document_id: docData.id,
+        user_id: user.id,
+        project_id: projectId && projectId !== 'null' && projectId !== 'undefined' ? projectId : null,
+        chunk_text: chunk,
+        chunk_index: index,
+        metadata: chunkMetadata,
+        embedding_model: analysis.embeddingModel
+      };
+
+      // Use appropriate column based on model
+      if (isLargeModel) {
+        chunkData.embedding_large = embeddings[index];
+        chunkData.embedding = null; // Clear small embedding
+      } else {
+        chunkData.embedding = embeddings[index];
+        chunkData.embedding_large = null; // Clear large embedding
+      }
+
+      return chunkData;
+    });
 
     const { error: chunksError } = await supabase
         .from('doc_chunks')
@@ -290,7 +332,14 @@ export async function POST(request: NextRequest) {
       documentId: docData.id,
       chunksCount: chunks.length,
       projectId: projectId,
-      fileType: isExcelFile ? 'Excel' : file.type
+      fileType: isPdfFile ? 'PDF' : (isExcelFile ? 'Excel' : file.type),
+      analysis: {
+        docType: analysis.docType,
+        embeddingModel: analysis.embeddingModel,
+        confidence: analysis.confidence,
+        sectionsFound: analysis.sections.length,
+        entitiesFound: Object.keys(analysis.entities).length
+      }
     });
 
   } catch (error) {

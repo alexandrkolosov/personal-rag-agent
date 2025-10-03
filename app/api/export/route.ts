@@ -15,7 +15,7 @@ export async function POST(request: NextRequest) {
 
     if (format === 'csv') {
         // Простая CSV конвертация
-        const csv = messages.map(m => `"${m.role}","${m.content}"`).join('\n');
+        const csv = `"Content"\n"${content}"`;
         return new Response(csv, {
             headers: {
                 'Content-Type': 'text/csv',

@@ -7,6 +7,8 @@ import { createClient } from '../lib/supabase-browser';
 import { useRouter } from 'next/navigation';
 import { useDebounce } from '../hooks/useDebounce';
 import MessageItem from './components/MessageItem';
+import ComparisonResults from './components/ComparisonResults';
+import { exportToMarkdown, exportToCSV, exportToDocx, downloadFile, exportComparisonToMarkdown } from '../lib/exportUtils';
 
 const supabase = createClient();
 
@@ -53,6 +55,19 @@ export default function Home() {
     const [searchMode, setSearchMode] = useState<'web' | 'academic' | 'sec'>('web');
     const [domainFilter, setDomainFilter] = useState<string>('');
     const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
+
+    // НОВОЕ: стейты для сравнения документов
+    const [comparisonMode, setComparisonMode] = useState(false);
+    const [selectedDocsForComparison, setSelectedDocsForComparison] = useState<string[]>([]);
+    const [showComparisonResults, setShowComparisonResults] = useState(false);
+    const [comparisonResults, setComparisonResults] = useState<any>(null);
+    const [comparing, setComparing] = useState(false);
+
+    // НОВОЕ: стейты для управления кэшем
+    const [clearingCache, setClearingCache] = useState(false);
+    const [cacheStats, setCacheStats] = useState<any>(null);
+    const [showCacheNotification, setShowCacheNotification] = useState(false);
+    const [cacheNotificationMessage, setCacheNotificationMessage] = useState('');
 
     // Получение пользователя и сессии
     useEffect(() => {
@@ -238,6 +253,61 @@ export default function Home() {
         router.push('/login');
     };
 
+    // Очистка кэша
+    const handleClearCache = async () => {
+        // Показываем подтверждение
+        if (!confirm('Очистить память?\n\nЭто удалит кэшированные результаты поиска и следующие запросы будут получать свежие данные из Perplexity.')) {
+            return;
+        }
+
+        setClearingCache(true);
+
+        try {
+            const response = await fetch('/api/cache/clear', {
+                method: 'POST'
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                setCacheNotificationMessage('✅ Память очищена! Следующие поиски будут свежими.');
+                setShowCacheNotification(true);
+
+                // Скрыть уведомление через 3 секунды
+                setTimeout(() => {
+                    setShowCacheNotification(false);
+                }, 3000);
+            } else {
+                setCacheNotificationMessage('❌ Ошибка при очистке кэша');
+                setShowCacheNotification(true);
+                setTimeout(() => {
+                    setShowCacheNotification(false);
+                }, 3000);
+            }
+        } catch (error) {
+            console.error('Cache clear error:', error);
+            setCacheNotificationMessage('❌ Не удалось очистить кэш');
+            setShowCacheNotification(true);
+            setTimeout(() => {
+                setShowCacheNotification(false);
+            }, 3000);
+        } finally {
+            setClearingCache(false);
+        }
+    };
+
+    // Получение статистики кэша
+    const fetchCacheStats = async () => {
+        try {
+            const response = await fetch('/api/cache/clear');
+            if (response.ok) {
+                const stats = await response.json();
+                setCacheStats(stats);
+            }
+        } catch (error) {
+            console.error('Failed to fetch cache stats:', error);
+        }
+    };
+
     // Обработка файлов
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files[0]) {
@@ -322,6 +392,46 @@ export default function Home() {
         }
     };
 
+    // НОВОЕ: обработка сравнения документов
+    const handleCompareDocuments = useCallback(async (comparisonType: 'semantic' | 'ai_powered' = 'semantic') => {
+        if (selectedDocsForComparison.length < 2) {
+            alert('Выберите минимум 2 документа для сравнения');
+            return;
+        }
+
+        setComparing(true);
+
+        try {
+            const response = await fetch('/api/compare', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${session.access_token}`,
+                },
+                body: JSON.stringify({
+                    documentIds: selectedDocsForComparison,
+                    comparisonType,
+                    projectId: activeProject?.id
+                }),
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Ошибка сравнения');
+            }
+
+            setComparisonResults(data.comparison);
+            setShowComparisonResults(true);
+            console.log('Comparison completed:', data.comparison);
+
+        } catch (error) {
+            alert(`Ошибка: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
+        } finally {
+            setComparing(false);
+        }
+    }, [selectedDocsForComparison, session, activeProject]);
+
     // НОВОЕ: обработка уточнений
     const handleClarificationResponse = async (answers: Record<string, any>) => {
         setClarificationMode(null);
@@ -357,6 +467,11 @@ export default function Home() {
                     } catch (e) {
                         console.log('Answer is plain text, using as is');
                     }
+                }
+
+                // Add warning message if present (e.g., rate limit)
+                if (data.warning) {
+                    finalAnswer = `${data.warning}\n\n${finalAnswer}`;
                 }
 
                 setMessages(prev => [...prev, {
@@ -443,6 +558,11 @@ export default function Home() {
                     }
                 }
 
+                // Add warning message if present (e.g., rate limit)
+                if (data.warning) {
+                    finalAnswer = `${data.warning}\n\n${finalAnswer}`;
+                }
+
                 setMessages(prev => [...prev, {
                     role: 'assistant',
                     content: finalAnswer,
@@ -476,11 +596,65 @@ export default function Home() {
     };
 
     // Экспорт чата
-    const exportChat = async (format: 'markdown' | 'csv' | 'docx') => {
-        // TODO: Реализовать экспорт в разные форматы
-        console.log(`Экспорт в формате ${format}`);
-        alert(`Экспорт в ${format} будет добавлен в следующей версии`);
-    };
+    const exportChat = useCallback(async (format: 'markdown' | 'csv' | 'docx') => {
+        if (messages.length === 0) {
+            alert('Нет сообщений для экспорта');
+            return;
+        }
+
+        // Загружаем сообщения непосредственно из БД для гарантии актуальности
+        try {
+            let query = supabase
+                .from('messages')
+                .select('role, content, metadata, created_at')
+                .eq('user_id', user.id)
+                .order('created_at', { ascending: true });
+
+            // Фильтруем по активному проекту
+            if (activeProject) {
+                query = query.eq('project_id', activeProject.id);
+            } else {
+                query = query.is('project_id', null);
+            }
+
+            const { data, error } = await query;
+
+            if (error) {
+                throw new Error('Ошибка загрузки сообщений: ' + error.message);
+            }
+
+            if (!data || data.length === 0) {
+                alert('Нет сообщений для экспорта');
+                return;
+            }
+
+            // Преобразуем в формат для экспорта
+            const messagesToExport = data.map(msg => ({
+                role: msg.role,
+                content: msg.content,
+                sources: msg.metadata?.sources || [],
+                webSources: msg.metadata?.webSources || []
+            }));
+
+            const projectName = activeProject?.name || 'Без проекта';
+            const timestamp = new Date().toISOString().split('T')[0];
+            const filename = `chat_${projectName.replace(/[^a-zA-Zа-яА-Я0-9]/g, '_')}_${timestamp}`;
+
+            if (format === 'markdown') {
+                const markdown = exportToMarkdown(messagesToExport, projectName);
+                downloadFile(markdown, `${filename}.md`, 'text/markdown');
+            } else if (format === 'csv') {
+                const csv = exportToCSV(messagesToExport, projectName);
+                downloadFile(csv, `${filename}.csv`, 'text/csv');
+            } else if (format === 'docx') {
+                const docxBlob = await exportToDocx(messagesToExport, projectName);
+                downloadFile(docxBlob, `${filename}.docx`, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+            }
+        } catch (error) {
+            console.error('Export error:', error);
+            alert(`Ошибка экспорта: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
+        }
+    }, [messages, activeProject, user]);
 
     // Очистка чата текущего проекта
     const clearChat = async () => {
@@ -548,9 +722,18 @@ export default function Home() {
     }
 
     return (
-        <main className="min-h-screen bg-gray-900 text-white">
+        <main className="min-h-screen bg-warm-50 text-warm-800">
+            {/* Toast Notification */}
+            {showCacheNotification && (
+                <div className="fixed top-4 right-4 z-50 animate-fade-in">
+                    <div className="bg-white border border-warm-200 rounded-lg px-4 py-3 max-w-md shadow-sm">
+                        <p className="text-sm text-warm-700">{cacheNotificationMessage}</p>
+                    </div>
+                </div>
+            )}
+
             {/* Верхняя панель с проектами */}
-            <div className="bg-gray-800 border-b border-gray-700 px-4 py-3">
+            <div className="bg-white border-b border-warm-200 px-4 py-3">
                 <div className="flex items-center justify-between max-w-7xl mx-auto">
                     {/* Селектор проектов */}
                     <div className="flex items-center gap-4">
@@ -560,7 +743,7 @@ export default function Home() {
                                 const project = projects.find(p => p.id === e.target.value);
                                 setActiveProject(project);
                             }}
-                            className="bg-gray-700 text-white px-4 py-2 rounded-lg border border-gray-600 focus:border-blue-500 focus:outline-none"
+                            className="bg-white text-warm-800 px-3 py-1.5 rounded-lg border border-warm-200 focus:border-accent-400 focus:outline-none transition-colors text-sm"
                         >
                             <option value="">Выберите проект</option>
                             {projects.map(p => (
@@ -572,16 +755,16 @@ export default function Home() {
 
                         <button
                             onClick={() => setShowProjectModal(true)}
-                            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"
+                            className="bg-accent-500 hover:bg-accent-600 text-white px-4 py-1.5 rounded-lg text-sm font-normal transition-colors"
                         >
                             ➕ Новый проект
                         </button>
 
                         {activeProject && (
-                            <div className="flex items-center gap-2 ml-4 text-gray-400">
-                                <span>Роль AI:</span>
-                                <span className="text-white font-medium">
-                                    {AI_ROLES[activeProject.role]?.split(' - ')[0] || activeProject.role}
+                            <div className="flex items-center gap-2 ml-4 text-warm-600">
+                                <span className="text-sm">Роль AI:</span>
+                                <span className="text-warm-800 font-semibold">
+                                    {AI_ROLES[activeProject.role as keyof typeof AI_ROLES]?.split(' - ')[0] || activeProject.role}
                                 </span>
                             </div>
                         )}
@@ -627,7 +810,7 @@ export default function Home() {
             </div>
 
             {/* НОВОЕ: Панель настроек поиска */}
-            <div className="bg-gray-800 border-b border-gray-700 px-4 py-2">
+            <div className="bg-warm-50 border-b border-warm-200 px-4 py-2">
                 <div className="max-w-7xl mx-auto">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-4 flex-wrap">
@@ -639,6 +822,21 @@ export default function Home() {
                                     className="rounded"
                                 />
                                 <span>🌐 Web Search</span>
+                            </label>
+
+                            <label className="flex items-center gap-2 text-sm">
+                                <input
+                                    type="checkbox"
+                                    checked={comparisonMode}
+                                    onChange={(e) => {
+                                        setComparisonMode(e.target.checked);
+                                        if (!e.target.checked) {
+                                            setSelectedDocsForComparison([]);
+                                        }
+                                    }}
+                                    className="rounded"
+                                />
+                                <span>📊 Сравнение документов</span>
                             </label>
 
                             {webSearchEnabled && (
@@ -661,19 +859,33 @@ export default function Home() {
                                     </button>
                                 </>
                             )}
+
+                            {/* Clear Memory Button */}
+                            <button
+                                onClick={handleClearCache}
+                                disabled={clearingCache}
+                                className="text-xs px-3 py-1 bg-warm-200 hover:bg-warm-300 disabled:bg-warm-100 disabled:text-warm-400 text-warm-700 rounded-lg transition-colors flex items-center gap-1"
+                                title="Очистить кэш поиска для получения свежих результатов"
+                            >
+                                {clearingCache ? (
+                                    <>🔄 Очистка...</>
+                                ) : (
+                                    <>🧹 Очистить память</>
+                                )}
+                            </button>
                         </div>
                     </div>
 
                     {/* Расширенные настройки */}
                     {webSearchEnabled && showAdvancedSearch && (
-                        <div className="mt-3 pt-3 border-t border-gray-700 flex gap-4 flex-wrap items-center">
+                        <div className="mt-2 pt-2 border-t border-warm-200 flex gap-4 flex-wrap items-center">
                             {/* Режим поиска */}
-                            <div className="flex items-center gap-2 text-sm">
-                                <label className="text-gray-400">Режим:</label>
+                            <div className="flex items-center gap-2 text-xs">
+                                <label className="text-warm-600">Режим:</label>
                                 <select
                                     value={searchMode}
                                     onChange={(e) => setSearchMode(e.target.value as 'web' | 'academic' | 'sec')}
-                                    className="bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 text-sm"
+                                    className="bg-white text-warm-800 px-2 py-1 rounded-lg border border-warm-200 text-xs"
                                 >
                                     <option value="web">🌐 Web (Общий)</option>
                                     <option value="academic">🎓 Academic (Научный)</option>
@@ -683,13 +895,13 @@ export default function Home() {
 
                             {/* Фильтр доменов */}
                             <div className="flex items-center gap-2 text-sm flex-1 min-w-[300px]">
-                                <label className="text-gray-400">Домены:</label>
+                                <label className="text-warm-600">Домены:</label>
                                 <input
                                     type="text"
                                     placeholder="example.com, scholar.google.com"
                                     value={domainFilter}
                                     onChange={(e) => setDomainFilter(e.target.value)}
-                                    className="flex-1 bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 text-sm placeholder-gray-500"
+                                    className="flex-1 bg-white text-warm-800 px-2 py-1 rounded-lg border border-warm-200 text-xs placeholder-warm-400"
                                 />
                             </div>
 
@@ -697,21 +909,21 @@ export default function Home() {
                             <div className="flex gap-2">
                                 <button
                                     onClick={() => setDomainFilter('scholar.google.com, arxiv.org, nature.com, science.org')}
-                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
                                     title="Научные источники"
                                 >
                                     🎓 Наука
                                 </button>
                                 <button
                                     onClick={() => setDomainFilter('sec.gov, edgar.gov')}
-                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
                                     title="SEC финансовые отчеты"
                                 >
                                     📊 SEC
                                 </button>
                                 <button
                                     onClick={() => setDomainFilter('reuters.com, bloomberg.com, ft.com')}
-                                    className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                    className="text-xs bg-warm-100 hover:bg-warm-200 text-warm-700 px-2 py-1 rounded-lg transition-colors"
                                     title="Новостные источники"
                                 >
                                     📰 Новости
@@ -735,38 +947,38 @@ export default function Home() {
                     {/* Левая панель - документы */}
                     <div className="lg:col-span-1 space-y-4">
                         {/* Загрузка файлов */}
-                        <div className="bg-gray-800 rounded-lg p-4">
-                            <h3 className="font-semibold mb-3">📎 Документы проекта</h3>
+                        <div className="bg-white rounded-lg border border-warm-200 p-4">
+                            <h3 className="font-medium text-warm-800 mb-3 text-sm">📎 Документы проекта</h3>
                             <input
                                 id="fileInput"
                                 type="file"
                                 onChange={handleFileChange}
-                                className="block w-full mb-2 text-sm text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:bg-gray-700 file:text-white hover:file:bg-gray-600"
+                                className="block w-full mb-2 text-xs text-warm-700 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-warm-200 file:text-xs file:bg-warm-50 file:text-warm-700 hover:file:bg-warm-100 file:transition-colors"
                                 accept=".txt,.docx,.xlsx,.xls,.csv"
                             />
-                            <div className="text-xs text-gray-400 mb-2">
+                            <div className="text-xs text-warm-500 mb-2">
                                 Поддерживаются: DOCX, TXT, XLSX, XLS, CSV
                             </div>
                             <button
                                 onClick={handleUpload}
                                 disabled={!file || uploading}
-                                className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white py-2 rounded transition"
+                                className="w-full bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 rounded-lg text-sm font-normal transition-colors"
                             >
                                 {uploading ? '⏳ Загрузка...' : '📤 Загрузить'}
                             </button>
 
                             {uploadStatus && (
-                                <div className={`mt-2 p-2 rounded text-sm ${
+                                <div className={`mt-2 p-2 rounded-lg text-xs border ${
                                     uploadStatus.includes('❌')
-                                        ? 'bg-red-900/20 text-red-400'
-                                        : 'bg-green-900/20 text-green-400'
+                                        ? 'bg-red-50 text-red-600 border-red-200'
+                                        : 'bg-green-50 text-green-600 border-green-200'
                                 }`}>
                                     {uploadStatus}
                                 </div>
                             )}
 
                             {/* Авто-саммари при загрузке */}
-                            <label className="flex items-center gap-2 mt-3 text-sm text-gray-300">
+                            <label className="flex items-center gap-2 mt-3 text-xs text-warm-700">
                                 <input
                                     type="checkbox"
                                     checked={autoSummary}
@@ -778,15 +990,15 @@ export default function Home() {
                         </div>
 
                         {/* Список документов */}
-                        <div className="bg-gray-800 rounded-lg p-4">
+                        <div className="bg-white rounded-lg border border-warm-200 p-4">
                             <div className="flex justify-between items-center mb-3">
-                                <h3 className="font-semibold">
+                                <h3 className="font-medium text-warm-800 text-sm">
                                     Файлы ({projectDocuments.length})
                                 </h3>
                                 <button
                                     onClick={() => loadDocuments()}
                                     disabled={loadingDocs}
-                                    className="text-sm text-blue-400 hover:text-blue-300"
+                                    className="text-xs text-accent-600 hover:text-accent-700"
                                 >
                                     {loadingDocs ? '⏳' : '🔄'}
                                 </button>
@@ -794,24 +1006,47 @@ export default function Home() {
 
                             <div className="max-h-96 overflow-y-auto space-y-2">
                                 {projectDocuments.length === 0 ? (
-                                    <p className="text-gray-500 text-center py-4">
+                                    <p className="text-warm-400 text-center py-4 text-xs">
                                         Документы еще не загружены
                                     </p>
                                 ) : (
                                     projectDocuments.map(doc => (
-                                        <div key={doc.id} className="p-2 bg-gray-700 rounded hover:bg-gray-600 transition">
+                                        <div key={doc.id} className="p-2 bg-warm-50 rounded-lg border border-warm-200 hover:bg-warm-100 transition-colors">
                                             <div className="flex justify-between items-start">
+                                                {comparisonMode && (
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedDocsForComparison.includes(doc.id)}
+                                                        onChange={(e) => {
+                                                            if (e.target.checked) {
+                                                                if (selectedDocsForComparison.length >= 5) {
+                                                                    alert('Максимум 5 документов для сравнения');
+                                                                    return;
+                                                                }
+                                                                setSelectedDocsForComparison([...selectedDocsForComparison, doc.id]);
+                                                            } else {
+                                                                setSelectedDocsForComparison(selectedDocsForComparison.filter(id => id !== doc.id));
+                                                            }
+                                                        }}
+                                                        className="mr-2 mt-1"
+                                                    />
+                                                )}
                                                 <div className="flex-1 min-w-0">
-                                                    <p className="text-sm font-medium truncate">
+                                                    <p className="text-xs font-normal truncate text-warm-800">
                                                         📄 {doc.filename}
+                                                        {doc.doc_type && doc.doc_type !== 'general' && (
+                                                            <span className="ml-2 text-[10px] px-1.5 py-0.5 bg-info/10 text-info rounded">
+                                                                {doc.doc_type}
+                                                            </span>
+                                                        )}
                                                     </p>
-                                                    <p className="text-xs text-gray-400 mt-1">
+                                                    <p className="text-[10px] text-warm-500 mt-0.5">
                                                         {formatFileSize(doc.file_size)} • {formatDate(doc.created_at)}
                                                     </p>
                                                 </div>
                                                 <button
                                                     onClick={() => handleDeleteDocument(doc.id)}
-                                                    className="ml-2 text-red-400 hover:text-red-300 text-sm"
+                                                    className="ml-2 text-red-500 hover:text-red-600 text-xs transition-colors"
                                                 >
                                                     🗑️
                                                 </button>
@@ -820,34 +1055,81 @@ export default function Home() {
                                     ))
                                 )}
                             </div>
+
+                            {/* Кнопка сравнения документов */}
+                            {comparisonMode && selectedDocsForComparison.length >= 2 && (
+                                <div className="mt-4 space-y-2">
+                                    <button
+                                        onClick={() => handleCompareDocuments('semantic')}
+                                        disabled={comparing}
+                                        className="w-full bg-info hover:bg-info/90 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 px-3 rounded-lg text-sm font-normal transition-colors"
+                                    >
+                                        {comparing ? '⏳ Сравнение...' : `⚡ Быстрое сравнение (${selectedDocsForComparison.length} док.)`}
+                                    </button>
+                                    <button
+                                        onClick={() => handleCompareDocuments('ai_powered')}
+                                        disabled={comparing}
+                                        className="w-full bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 px-3 rounded-lg text-sm font-normal transition-colors"
+                                    >
+                                        {comparing ? '⏳ Сравнение...' : `🤖 AI-анализ (${selectedDocsForComparison.length} док.)`}
+                                    </button>
+                                </div>
+                            )}
                         </div>
                     </div>
 
                     {/* Центр - чат */}
-                    <div className="lg:col-span-2 bg-gray-800 rounded-lg p-4 flex flex-col h-[calc(100vh-180px)]">
+                    <div className="lg:col-span-2 bg-white rounded-lg border border-warm-200 p-4 flex flex-col h-[calc(100vh-180px)]">
                         {/* Контекстная строка */}
-                        <div className="bg-gray-700 rounded p-2 mb-3 text-sm flex justify-between items-center">
+                        <div className="bg-warm-50 border border-warm-200 rounded-lg p-2 mb-3 text-xs flex justify-between items-center">
                             <div>
                                 📁 Проект: <strong>{activeProject.name}</strong> |
-                                🤖 Роль: <strong>{AI_ROLES[activeProject.role]?.split(' - ')[0] || activeProject.role}</strong> |
+                                🤖 Роль: <strong>{AI_ROLES[activeProject.role as keyof typeof AI_ROLES]?.split(' - ')[0] || activeProject.role}</strong> |
                                 📄 Документов: <strong>{projectDocuments.length}</strong> |
                                 💬 Сообщений: <strong>{messages.length}</strong>
-                                {webSearchEnabled && ' | 🌐 Web: ON'}
+                                {webSearchEnabled && ' | 🌐 Web: ON'} | 💾 Cache: ON | ⏱️ Throttled
                             </div>
-                            <button
-                                onClick={clearChat}
-                                className="text-gray-400 hover:text-white transition text-xs"
-                                title="Очистить чат этого проекта"
-                            >
-                                🗑️ Очистить чат
-                            </button>
+                            <div className="flex gap-2">
+                                {messages.length > 0 && (
+                                    <>
+                                        <button
+                                            onClick={() => exportChat('markdown')}
+                                            className="text-gray-400 hover:text-white transition text-xs"
+                                            title="Экспорт в Markdown"
+                                        >
+                                            📥 MD
+                                        </button>
+                                        <button
+                                            onClick={() => exportChat('csv')}
+                                            className="text-gray-400 hover:text-white transition text-xs"
+                                            title="Экспорт в CSV"
+                                        >
+                                            📥 CSV
+                                        </button>
+                                        <button
+                                            onClick={() => exportChat('docx')}
+                                            className="text-gray-400 hover:text-white transition text-xs"
+                                            title="Экспорт в Word"
+                                        >
+                                            📥 DOCX
+                                        </button>
+                                    </>
+                                )}
+                                <button
+                                    onClick={clearChat}
+                                    className="text-gray-400 hover:text-white transition text-xs"
+                                    title="Очистить чат этого проекта"
+                                >
+                                    🗑️
+                                </button>
+                            </div>
                         </div>
 
                         {/* Сообщения */}
-                        <div className="flex-1 overflow-y-auto mb-4 space-y-2">
+                        <div className="flex-1 overflow-y-auto mb-3 space-y-3">
                             {messages.length === 0 ? (
                                 <div className="text-center py-12">
-                                    <p className="text-gray-500 mb-4">
+                                    <p className="text-warm-500 text-sm">
                                         {projectDocuments.length > 0
                                             ? "✅ RAG активирован! Задавайте вопросы по документам"
                                             : "Загрузите документы и начните задавать вопросы"}
@@ -862,12 +1144,12 @@ export default function Home() {
 
                         {/* Предложенные вопросы от AI */}
                         {suggestedQuestions.length > 0 && (
-                            <div className="flex gap-2 mb-2 flex-wrap">
+                            <div className="flex gap-1.5 mb-2 flex-wrap">
                                 {suggestedQuestions.map((q, idx) => (
                                     <button
                                         key={idx}
                                         onClick={() => setQuestion(q)}
-                                        className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition"
+                                        className="text-[10px] bg-warm-50 hover:bg-warm-100 text-warm-600 px-2 py-1 rounded border border-warm-200 transition-colors"
                                     >
                                         💡 {q}
                                     </button>
@@ -883,13 +1165,13 @@ export default function Home() {
                                 onChange={(e) => setQuestion(e.target.value)}
                                 onKeyPress={(e) => e.key === 'Enter' && !asking && handleAsk()}
                                 placeholder="Задайте вопрос о документах..."
-                                className="flex-1 bg-gray-700 text-white px-4 py-2 rounded focus:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="flex-1 bg-white text-warm-800 placeholder-warm-400 px-4 py-2 rounded-lg border border-warm-200 focus:border-accent-400 focus:outline-none transition-colors text-sm"
                                 disabled={asking}
                             />
                             <button
                                 onClick={handleAsk}
                                 disabled={!question.trim() || asking}
-                                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-6 py-2 rounded transition"
+                                className="bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm transition-colors"
                             >
                                 {asking ? '⏳' : '📤'}
                             </button>
@@ -903,7 +1185,7 @@ export default function Home() {
                         <p className="text-gray-400 mb-6">Создайте первый проект для работы с документами</p>
                         <button
                             onClick={() => setShowProjectModal(true)}
-                            className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg transition"
+                            className="bg-accent-500 hover:bg-accent-600 text-white px-6 py-2 rounded-lg text-sm font-normal transition-colors"
                         >
                             ➕ Создать проект
                         </button>
@@ -913,8 +1195,8 @@ export default function Home() {
 
             {/* Модалка создания проекта */}
             {showProjectModal && (
-                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-                    <div className="bg-gray-800 p-6 rounded-lg w-96">
+                <div className="fixed inset-0 bg-black/20 flex items-center justify-center z-50">
+                    <div className="bg-white p-6 rounded-lg w-96 shadow-lg border border-warm-200">
                         <h2 className="text-xl mb-4">Новый проект</h2>
 
                         <input
@@ -922,15 +1204,15 @@ export default function Home() {
                             placeholder="Название проекта"
                             value={newProjectName}
                             onChange={(e) => setNewProjectName(e.target.value)}
-                            className="w-full bg-gray-700 px-3 py-2 rounded mb-3 focus:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mb-3 focus:border-accent-400 focus:outline-none text-sm"
                         />
 
                         <label className="block mb-3">
-                            <span className="text-sm text-gray-400">Роль AI:</span>
+                            <span className="text-sm text-warm-600">Роль AI:</span>
                             <select
                                 value={selectedRole}
                                 onChange={(e) => setSelectedRole(e.target.value)}
-                                className="w-full bg-gray-700 px-3 py-2 rounded mt-1 focus:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mt-1 focus:border-accent-400 focus:outline-none text-sm"
                             >
                                 {Object.entries(AI_ROLES).map(([key, value]) => (
                                     <option key={key} value={key}>{value}</option>
@@ -943,7 +1225,7 @@ export default function Home() {
                                 placeholder="Опишите роль AI..."
                                 value={customRole}
                                 onChange={(e) => setCustomRole(e.target.value)}
-                                className="w-full bg-gray-700 px-3 py-2 rounded mb-3 h-20 focus:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className="w-full bg-white border border-warm-200 text-warm-800 px-3 py-2 rounded-lg mb-3 h-20 focus:border-accent-400 focus:outline-none text-sm"
                             />
                         )}
 
@@ -951,7 +1233,7 @@ export default function Home() {
                             <button
                                 onClick={createProject}
                                 disabled={!newProjectName.trim()}
-                                className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white py-2 rounded transition"
+                                className="flex-1 bg-accent-500 hover:bg-accent-600 disabled:bg-warm-300 disabled:cursor-not-allowed text-white py-2 rounded-lg text-sm font-normal transition-colors"
                             >
                                 Создать
                             </button>
@@ -962,7 +1244,7 @@ export default function Home() {
                                     setSelectedRole('analyst');
                                     setCustomRole('');
                                 }}
-                                className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2 rounded transition"
+                                className="flex-1 bg-warm-300 hover:bg-warm-400 text-warm-700 py-2 rounded-lg text-sm font-normal transition-colors"
                             >
                                 Отмена
                             </button>
@@ -1089,6 +1371,19 @@ export default function Home() {
                         </div>
                     </div>
                 </div>
+            )}
+
+            {/* Comparison Results Modal */}
+            {showComparisonResults && comparisonResults && (
+                <ComparisonResults
+                    comparison={comparisonResults}
+                    onClose={() => {
+                        setShowComparisonResults(false);
+                        setComparisonResults(null);
+                        setSelectedDocsForComparison([]);
+                        setComparisonMode(false);
+                    }}
+                />
             )}
         </main>
     );

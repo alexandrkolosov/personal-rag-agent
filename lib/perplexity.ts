@@ -1,9 +1,15 @@
 // lib/perplexity.ts
+// Direct API approach - proven to work reliably
+
+import { searchCache } from './searchCache';
+import { semanticCache } from './semanticCache';
+import { perplexityThrottler } from './requestThrottler';
 
 interface PerplexityConfig {
     apiKey: string;
     model?: 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro';
     maxTokens?: number;
+    useCache?: boolean;
 }
 
 interface SearchOptions {
@@ -13,6 +19,15 @@ interface SearchOptions {
     searchRecencyFilter?: 'day' | 'week' | 'month' | 'year';
     searchMode?: 'web' | 'academic' | 'sec';
     model?: 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro';
+    // Structured outputs support
+    responseFormat?: {
+        type: 'json_schema';
+        json_schema: {
+            name?: string;
+            schema: Record<string, any>;
+            strict?: boolean;
+        };
+    };
 }
 
 interface WebSource {
@@ -25,24 +40,75 @@ export class PerplexityClient {
     private apiKey: string;
     private baseUrl = 'https://api.perplexity.ai';
     private defaultModel: string;
+    private useCache: boolean;
 
     constructor(config: PerplexityConfig) {
         this.apiKey = config.apiKey || process.env.PERPLEXITY_API_KEY!;
-        this.defaultModel = config.model || 'sonar-deep-research';
+        this.defaultModel = config.model || 'sonar-pro'; // Fast, reliable, good quality
+        this.useCache = config.useCache ?? true; // Cache enabled by default
     }
 
     async search(query: string, options?: SearchOptions) {
+        // IMPORTANT: For web searches, we DISABLE semantic caching because:
+        // 1. Web data changes constantly - cached results become stale
+        // 2. Entity queries need fresh results (e.g., "Колосов Александр" vs "Колосов Алексей")
+        // 3. 95% similarity can match wrong entities
+
+        // LAYER 1: Check exact match cache ONLY (fast, <1ms)
+        // This is safe because it requires EXACT query match
+        if (this.useCache) {
+            const cacheKey = { query, options };
+            const cached = searchCache.get(query, cacheKey);
+            if (cached) {
+                console.log('✅ Exact cache HIT - returning cached result');
+                return cached;
+            }
+        }
+
+        console.log('❌ Cache MISS - fetching fresh results from Perplexity');
+
+        // SKIP LAYER 2 (Semantic Cache) for web searches
+        // Semantic cache disabled to prevent stale/wrong results
+
+        // LAYER 3: Execute actual API request with throttling
+        const result = await perplexityThrottler.execute(async () => {
+            return this.executeSearchWithRetry(query, options);
+        });
+
+        // Store in EXACT match cache only (not semantic cache)
+        if (this.useCache) {
+            const cacheKey = { query, options };
+            searchCache.set(query, result, cacheKey);
+        }
+
+        return result;
+    }
+
+    private async executeSearchWithRetry(query: string, options?: SearchOptions, retryCount: number = 0): Promise<any> {
+        // No retry - simple, direct call
+        return await this.executeSearch(query, options, retryCount);
+    }
+
+    private async executeSearch(query: string, options?: SearchOptions, retryCount: number = 0) {
         try {
+            // Always use sonar-pro: fast, reliable, good quality
+            const model = options?.model || 'sonar-pro';
+
+            console.log('🔍 Perplexity Search:');
+            console.log('  Query:', query);
+            console.log('  Model:', model);
+
+            // Build request body
             const requestBody: any = {
-                model: options?.model || this.defaultModel,
+                model,
                 messages: [
                     {
                         role: 'system',
-                        content: 'You are a helpful search assistant. Provide accurate, up-to-date information with detailed sources and citations.'
+                        content: 'Be comprehensive and accurate.'
                     },
                     {
                         role: 'user',
-                        content: query
+                        content: query  // Send query exactly as provided
                     }
                 ],
                 temperature: 0.2,
@@ -66,74 +132,131 @@ export class PerplexityClient {
                 requestBody.search_domain_filter = options.searchDomainFilter;
             }
 
-            const response = await fetch(`${this.baseUrl}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.apiKey}`,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(requestBody)
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('Perplexity error:', errorText);
-                throw new Error(`Perplexity API error: ${response.status}`);
+            // Add structured output format if specified
+            if (options?.responseFormat) {
+                requestBody.response_format = options.responseFormat;
+                console.log('📋 Using structured output:', options.responseFormat.json_schema.name);
             }
 
-            const data = await response.json();
+            // Simple 30 second timeout
+            const timeoutDuration = 30000;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutDuration);
 
-            console.log('Perplexity raw response:', JSON.stringify(data, null, 2));
+            try {
+                const response = await fetch(`${this.baseUrl}/chat/completions`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${this.apiKey}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(requestBody),
+                    signal: controller.signal
+                });
 
-            // Extract comprehensive metadata
-            const message = data.choices?.[0]?.message;
+                clearTimeout(timeoutId);
 
-            // Perplexity API returns citations as an array of URL strings
-            // Format: ["https://example.com", "https://example2.com"]
-            let citations = data.citations || [];
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('❌ Perplexity error:', errorText);
 
-            // Parse sources - Perplexity returns plain URLs
-            const sources: WebSource[] = citations
-                .filter((citation: any) => citation) // Filter out null/undefined
-                .map((url: string, index: number) => {
-                    if (typeof url === 'string' && url.startsWith('http')) {
-                        try {
-                            const urlObj = new URL(url);
-                            const hostname = urlObj.hostname.replace('www.', '');
-
-                            // Create a readable title from hostname
-                            const title = hostname
-                                .split('.')
-                                .slice(0, -1)
-                                .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-                                .join(' ') || hostname;
-
-                            return {
-                                title: title,
-                                url: url,
-                                snippet: '' // Perplexity doesn't provide snippets in citations
-                            };
-                        } catch (e) {
-                            console.error('Error parsing citation URL:', url, e);
-                            return null;
+                    // Parse error to provide better messages
+                    let errorMessage = `Perplexity API error: ${response.status}`;
+                    try {
+                        const errorData = JSON.parse(errorText);
+                        if (errorData.error?.message) {
+                            errorMessage = errorData.error.message;
                         }
+                    } catch (e) {
+                        // Use default error message if parsing fails
                     }
-                    return null;
-                })
-                .filter((source): source is WebSource => source !== null && !!source.url);
 
-            console.log('Parsed sources:', sources);
+                    // Handle rate limit specifically
+                    if (response.status === 429) {
+                        throw new Error('Perplexity API rate limit exceeded. Please wait a moment before trying again.');
+                    }
 
-            return {
-                answer: message?.content || '',
-                sources,
-                images: data.images || [],
-                relatedQuestions: data.related_questions || [],
-                model: requestBody.model,
-                usage: data.usage || {}
-            };
+                    throw new Error(errorMessage);
+                }
+
+                const data = await response.json();
+
+                console.log('✅ Perplexity response received');
+                console.log('📊 Response check:');
+                console.log('  - Has choices:', !!data.choices);
+                console.log('  - Has citations:', !!data.citations);
+                console.log('  - Citations count:', data.citations?.length || 0);
+                console.log('  - Has images:', !!data.images);
+                console.log('  - Has related_questions:', !!data.related_questions);
+
+                // Extract comprehensive metadata
+                const message = data.choices?.[0]?.message;
+
+                if (!message?.content) {
+                    console.warn('⚠️ No message content in response!');
+                }
+
+                // Perplexity API returns citations as an array of URL strings
+                let citations = data.citations || [];
+
+                // Parse sources - Perplexity returns plain URLs
+                const sources: WebSource[] = citations
+                    .filter((citation: any) => citation) // Filter out null/undefined
+                    .map((url: string, index: number) => {
+                        if (typeof url === 'string' && url.startsWith('http')) {
+                            try {
+                                const urlObj = new URL(url);
+                                const hostname = urlObj.hostname.replace('www.', '');
+
+                                // Create a readable title from hostname
+                                const title = hostname
+                                    .split('.')
+                                    .slice(0, -1)
+                                    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+                                    .join(' ') || hostname;
+
+                                return {
+                                    title: title,
+                                    url: url,
+                                    snippet: '' // Perplexity doesn't provide snippets in citations
+                                };
+                            } catch (e) {
+                                console.error('Error parsing citation URL:', url, e);
+                                return null;
+                            }
+                        }
+                        return null;
+                    })
+                    .filter((source: WebSource | null): source is WebSource => source !== null && !!source.url);
+
+                console.log('✅ Parsed', sources.length, 'sources');
+
+                const result = {
+                    answer: message?.content || '',
+                    sources,
+                    images: data.images || [],
+                    relatedQuestions: data.related_questions || [],
+                    model: requestBody.model,
+                    usage: data.usage || {}
+                };
+
+                // Note: Caching happens in the search() method, not here
+                // This avoids duplicate cache writes
+
+                return result;
+
+            } catch (fetchError: any) {
+                clearTimeout(timeoutId);
+
+                // Handle timeout specifically
+                if (fetchError.name === 'AbortError') {
+                    console.warn(`⏱️ Perplexity API timeout for query: "${query.substring(0, 50)}..."`);
+                    throw new Error('TIMEOUT');
+                }
+                throw fetchError;
+            }
         } catch (error) {
-            console.error('Perplexity search error:', error);
+            console.error('❌ Perplexity search error:', error);
             throw error;
         }
     }
@@ -178,18 +301,22 @@ export function shouldSearchWeb(
     return needsWeb || (!hasGoodDocContext && avgSimilarity < 0.5);
 }
 
-// Функция объединения контекстов
+/**
+ * Enrich context with web search using Perplexity API
+ * Supports grounded search with citations and structured outputs
+ */
 export async function enrichWithWebSearch(
     question: string,
     documentContext: any[],
-    options?: SearchOptions & { role?: string }
+    options?: SearchOptions & { role?: string; useStructuredOutput?: boolean }
 ): Promise<any> {
     // Выбираем модель в зависимости от роли
     const modelForRole = selectModelForRole(options?.role);
 
     const client = new PerplexityClient({
         apiKey: process.env.PERPLEXITY_API_KEY!,
-        model: modelForRole
+        model: modelForRole,
+        useCache: true  // Enable caching
     });
 
     // Формируем контекстный запрос с учетом контекста документов
@@ -210,6 +337,11 @@ export async function enrichWithWebSearch(
         model: modelForRole
     };
 
+    // Add structured output if requested
+    if (options?.useStructuredOutput && options?.responseFormat) {
+        console.log('📋 Using structured output with schema:', options.responseFormat.json_schema.name);
+    }
+
     const webResults = await client.search(contextualQuery, searchOptions);
 
     return {
@@ -224,24 +356,35 @@ export async function enrichWithWebSearch(
     };
 }
 
+// Model fallback chain - from slowest to fastest
+const MODEL_FALLBACK_CHAIN = [
+    'sonar-pro',           // Fast, good quality
+    'sonar'                // Fastest fallback
+] as const;
+
 // Выбор модели в зависимости от роли AI
-function selectModelForRole(role?: string): 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro' {
-    if (!role) return 'sonar-deep-research';
+function selectModelForRole(role?: string, useFastModel: boolean = false): 'sonar' | 'sonar-pro' | 'sonar-deep-research' | 'sonar-reasoning' | 'sonar-reasoning-pro' {
+    // If fast model requested (e.g., after timeout), use sonar as fallback
+    if (useFastModel) {
+        return 'sonar';
+    }
+
+    // Default to sonar-pro for good balance of speed and quality
+    if (!role) return 'sonar-pro';
 
     const roleLower = role.toLowerCase();
 
-    // CFO, Analyst, Lawyer требуют глубокого анализа
-    if (roleLower.includes('cfo') || roleLower.includes('analyst') || roleLower.includes('lawyer')) {
-        return 'sonar-deep-research';
+    // Use higher quality models for roles that need deep analysis
+    // These roles benefit from better reasoning even if slightly slower
+    if (roleLower.includes('analyst') ||
+        roleLower.includes('researcher') ||
+        roleLower.includes('consultant') ||
+        roleLower.includes('strategist')) {
+        return 'sonar-reasoning'; // Better quality for analytical roles
     }
 
-    // Investor требует reasoning для оценки потенциала
-    if (roleLower.includes('investor')) {
-        return 'sonar-reasoning-pro';
-    }
-
-    // По умолчанию используем deep research
-    return 'sonar-deep-research';
+    // Use faster model for general queries
+    return 'sonar-pro';
 }
 
 function extractTopics(context: any[]): string[] {
@@ -250,7 +393,7 @@ function extractTopics(context: any[]): string[] {
     context.forEach(chunk => {
         // Простая эвристика - можно улучшить с NLP
         const matches = chunk.text.match(/[A-Z][a-z]+ [A-Z][a-z]+/g) || [];
-        matches.forEach(m => topics.add(m));
+        matches.forEach((m: string) => topics.add(m));
     });
     return Array.from(topics).slice(0, 5);
 }

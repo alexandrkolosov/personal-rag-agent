@@ -15,10 +15,12 @@ RESPONSE PRINCIPLES:
 - Include specific examples and actionable steps
 - Think critically and identify gaps, risks, opportunities
 - Match user's language (Russian/English)
+- Use proper markdown formatting with line breaks (\n) between sections and table rows
+- Ensure tables have proper newlines: each row on a separate line
 
 JSON RESPONSE STRUCTURE:
 {
-  "answer": "Your comprehensive response here (can be very long, including full documents if requested)",
+  "answer": "Your COMPLETE comprehensive response here with FULL markdown formatting (##, ###, tables, lists, etc.). Include ALL analysis, ALL sections, ALL details. For document comparisons, include the ENTIRE comparison with all differences and similarities. This field contains the FULL response shown to user - NEVER summarize or truncate!",
   "citations": [
     {
       "doc_id": "document-uuid",
@@ -195,14 +197,27 @@ export function analyzeClarificationNeed(
     }
 
     if (lowerQ.includes('сравн') || lowerQ.includes('compar')) {
-        if (!lowerQ.includes('с ')) {
+        // Check if specific entities are mentioned
+        const hasSpecificEntities = /\b([A-Z][a-z]+\s*){2,}\b/.test(question); // Check for capitalized words (company names)
+
+        if (!hasSpecificEntities) {
             clarifications.push({
-                id: 'comparison_target',
-                question: 'С чем сравнить?',
-                type: 'multiselect',
-                options: ['Конкуренты', 'Прошлый период', 'Рыночные стандарты', 'План/бюджет'],
+                id: 'comparison_entities',
+                question: 'Какие конкретно компании/объекты сравнить? (Укажите названия через запятую)',
+                type: 'text',
                 required: true,
-                context: 'Уточните базу для сравнения'
+                context: 'Для точного сравнения нужны конкретные названия'
+            });
+        }
+
+        // Check for location context
+        if (!lowerQ.match(/россия|russia|франция|france|китай|china|сша|usa/i)) {
+            clarifications.push({
+                id: 'geographic_scope',
+                question: 'В каком регионе/стране? (опционально)',
+                type: 'text',
+                required: false,
+                context: 'Регион помогает найти более релевантную информацию'
             });
         }
     }
@@ -325,8 +340,8 @@ Content: ${text}`;
     }).join("\n\n---\n\n");
 
     // Добавляем роль если указана
-    const roleContext = role && ROLE_PROMPTS[role]
-        ? `ACTIVE ROLE & PERSPECTIVE:\n${ROLE_PROMPTS[role]}\n`
+    const roleContext = role && ROLE_PROMPTS[role as keyof typeof ROLE_PROMPTS]
+        ? `ACTIVE ROLE & PERSPECTIVE:\n${ROLE_PROMPTS[role as keyof typeof ROLE_PROMPTS]}\n`
         : '';
 
     // Добавляем контекст предыдущих insights если есть
@@ -407,7 +422,7 @@ export function buildDocumentCreationPrompt(
     context: string,
     role?: string
 ): string {
-    const roleContext = role && ROLE_PROMPTS[role] ? ROLE_PROMPTS[role] : '';
+    const roleContext = role && ROLE_PROMPTS[role as keyof typeof ROLE_PROMPTS] ? ROLE_PROMPTS[role as keyof typeof ROLE_PROMPTS] : '';
 
     return `${roleContext}
 
@@ -436,7 +451,7 @@ export function buildCriticalAnalysisPrompt(
     role: string = 'analyst',
     focusAreas?: string[]
 ): string {
-    const roleContext = ROLE_PROMPTS[role] || ROLE_PROMPTS.analyst;
+    const roleContext = ROLE_PROMPTS[role as keyof typeof ROLE_PROMPTS] || ROLE_PROMPTS.analyst;
     const focus = focusAreas ? `\nSPECIFIC FOCUS AREAS:\n${focusAreas.join('\n')}` : '';
 
     return `${roleContext}${focus}
